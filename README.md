@@ -80,6 +80,21 @@ The `dataset/` directory contains:
 - `multilingual.jsonl` — Multi-language instances
 - `swe-bench_pro.jsonl` — SWE-bench Pro subset
 
+## Third-Party Licenses
+
+This project builds upon the following open-source assets:
+
+| Asset | License | URL |
+|-------|---------|-----|
+| SWE-bench | MIT | https://github.com/princeton-nlp/SWE-bench |
+| SWE-bench Verified | MIT | https://github.com/princeton-nlp/SWE-bench |
+| SWE-bench Pro | MIT | https://github.com/SWE-bench/SWE-bench-Pro |
+| SWE-bench Multilingual | MIT | https://github.com/multi-swe-bench/multi-swe-bench |
+| Harbor | Apache-2.0 | https://github.com/harbor-ai/harbor |
+| OpenCode | MIT | https://github.com/opencode-ai/opencode |
+
+All source datasets are derived from publicly available GitHub repositories under their respective open-source licenses. Our benchmark instances consist of metadata (commit hashes, issue descriptions, test patches) referencing these repositories and do not redistribute proprietary code.
+
 ## License
 
 MIT
