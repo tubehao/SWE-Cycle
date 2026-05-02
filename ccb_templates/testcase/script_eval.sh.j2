@@ -1,0 +1,189 @@
+#!/bin/bash
+set -euo pipefail
+
+mkdir -p /logs/artifacts /logs/verifier
+
+{% if benchmark == "pro" %}
+# ======= SWE-bench Pro TestCase evaluation path =======
+# Two-phase evaluation with language-aware regex judge:
+# code_patch IS applied in Dockerfile — agent sees fixed code at base_commit + code_patch.
+# Phase 1: revert code_patch, run eval.sh → should FAIL (tests detect the bug)
+# Phase 2: re-apply code_patch, run eval.sh → should PASS (tests pass with fix)
+
+# ── Record agent's work ──────────────────────────────────────────────────────
+cd {{ workdir }}
+git add -A
+git diff --cached HEAD > /logs/artifacts/prediction.diff 2>/dev/null || true
+cp /logs/artifacts/prediction.diff {{ workdir }}/agent.patch 2>/dev/null || true
+
+# Check eval.sh exists
+if [ ! -f {{ workdir }}/eval.sh ]; then
+    echo "ERROR: eval.sh not found in {{ workdir }}" | tee /logs/verifier/test_output.log
+    echo 0 > /logs/verifier/script_reward.txt
+    echo 0 > /logs/verifier/reward.txt
+    exit 1
+fi
+
+{% if before_repo_set_cmd %}
+{{ before_repo_set_cmd }}
+{% endif %}
+
+# ============ Phase 1: revert code_patch, run eval.sh (should FAIL) ============
+echo "=== Phase 1: Running tests with code_patch reverted (should FAIL) ==="
+
+cd {{ workdir }}
+# Ensure code_patch target files are in known state (fixed = initial commit) before reverting
+PATCH_FILES=$(grep '^diff --git' /tests/code_patch.diff | sed 's|diff --git a/\(.*\) b/.*|\1|' || true)
+if [ -n "$PATCH_FILES" ]; then
+    echo "$PATCH_FILES" | xargs git checkout HEAD -- 2>/dev/null || true
+fi
+# Revert code_patch to restore buggy state
+git apply -R /tests/code_patch.diff 2>/dev/null || git apply --reject -R /tests/code_patch.diff 2>/dev/null || true
+
+set +e
+bash {{ workdir }}/eval.sh 2>&1 | tee /logs/verifier/phase1_output.log
+set -e
+
+# Judge Phase 1: should NOT resolve (tests should fail on buggy code)
+set +e
+python3 /tests/judge_testcase.py /logs/verifier/phase1_output.log {{ language }}
+phase1_resolved=$?
+set -e
+
+if [ "${phase1_resolved}" -eq 0 ]; then
+    echo "FAILED: Phase 1 tests PASSED when they should have FAILED (on buggy code)"
+    echo "This means the agent's tests don't detect the bug."
+    cat /logs/verifier/phase1_output.log > /logs/verifier/test_output.log
+    echo 0 > /logs/verifier/script_reward.txt
+    echo 0 > /logs/verifier/reward.txt
+    exit 1
+fi
+echo "Phase 1 OK: Tests failed as expected (on buggy code)"
+
+# ============ Phase 2: re-apply code_patch, run eval.sh (should PASS) ============
+echo "=== Phase 2: Running tests WITH code patch restored (should PASS) ==="
+
+cd {{ workdir }}
+# Re-apply code_patch (restore fixed state)
+git apply /tests/code_patch.diff 2>/dev/null || git apply --reject /tests/code_patch.diff 2>/dev/null || true
+
+set +e
+bash {{ workdir }}/eval.sh 2>&1 | tee /logs/verifier/phase2_output.log
+set -e
+
+# Merge logs
+cat /logs/verifier/phase1_output.log /logs/verifier/phase2_output.log > /logs/verifier/test_output.log
+
+# Judge Phase 2: should resolve (tests should pass with code patch)
+set +e
+python3 /tests/judge_testcase.py /logs/verifier/phase2_output.log {{ language }}
+phase2_resolved=$?
+set -e
+
+if [ "${phase2_resolved}" -eq 0 ]; then
+    echo "PASSED: Both phases succeeded -- tests correctly detect the bug and pass after fix"
+    echo 1 > /logs/verifier/script_reward.txt
+else
+    echo "FAILED: Phase 2 tests failed (tests don't pass even with code patch applied)"
+    echo 0 > /logs/verifier/script_reward.txt
+fi
+
+SCRIPT_REWARD=$(cat /logs/verifier/script_reward.txt 2>/dev/null || echo "0")
+# Write Harbor reward now (script_reward is the primary reward)
+echo "$SCRIPT_REWARD" > /logs/verifier/reward.txt
+
+exit "${phase2_resolved}"
+
+{% else %}
+# ======= swebench / swe-multilingual TestCase evaluation path =======
+# Two-phase evaluation:
+# code_patch IS applied in Dockerfile — agent sees fixed code at base_commit + code_patch.
+# Phase 1: revert code_patch, run eval.sh → should FAIL (tests detect the bug)
+# Phase 2: re-apply code_patch, run eval.sh → should PASS (tests pass with fix)
+
+# ── Record agent's work ──────────────────────────────────────────────────────
+cd /testbed
+git add -A
+git diff --cached HEAD > /logs/artifacts/prediction.diff 2>/dev/null || true
+cp /logs/artifacts/prediction.diff /testbed/agent.patch 2>/dev/null || true
+
+# Check eval.sh exists
+if [ ! -f /testbed/eval.sh ]; then
+    echo "ERROR: eval.sh not found in /testbed" | tee /logs/verifier/test_output.log
+    echo 0 > /logs/verifier/script_reward.txt
+    echo 0 > /logs/verifier/reward.txt
+    exit 1
+fi
+
+# Activate conda environment (Python only)
+{% if language == "py" %}
+source /opt/miniconda3/bin/activate
+conda activate testbed
+{% endif %}
+
+# ============ Phase 1: revert code_patch, run eval.sh (should FAIL) ============
+echo "=== Phase 1: Running tests with code_patch reverted (should FAIL) ==="
+
+cd /testbed
+# Ensure code_patch target files are in known state (fixed = initial commit) before reverting
+PATCH_FILES=$(grep '^diff --git' /tests/code_patch.diff | sed 's|diff --git a/\(.*\) b/.*|\1|' || true)
+if [ -n "$PATCH_FILES" ]; then
+    echo "$PATCH_FILES" | xargs git checkout HEAD -- 2>/dev/null || true
+fi
+# Revert code_patch to restore buggy state
+git apply -R /tests/code_patch.diff 2>/dev/null || git apply --reject -R /tests/code_patch.diff 2>/dev/null || true
+
+set +e
+bash /testbed/eval.sh 2>&1 | tee /logs/verifier/phase1_output.log
+set -e
+
+# Judge Phase 1: should NOT resolve (tests should fail on buggy code)
+set +e
+python3 /tests/judge_testcase.py /logs/verifier/phase1_output.log {{ language }}
+phase1_resolved=$?
+set -e
+
+if [ "${phase1_resolved}" -eq 0 ]; then
+    echo "FAILED: Phase 1 tests PASSED when they should have FAILED (on buggy code)"
+    echo "This means the agent's tests don't detect the bug."
+    cat /logs/verifier/phase1_output.log > /logs/verifier/test_output.log
+    echo 0 > /logs/verifier/script_reward.txt
+    echo 0 > /logs/verifier/reward.txt
+    exit 1
+fi
+echo "Phase 1 OK: Tests failed as expected (on buggy code)"
+
+# ============ Phase 2: re-apply code_patch, run eval.sh (should PASS) ============
+echo "=== Phase 2: Running tests WITH code patch restored (should PASS) ==="
+
+cd /testbed
+# Re-apply code_patch (restore fixed state)
+git apply /tests/code_patch.diff 2>/dev/null || git apply --reject /tests/code_patch.diff 2>/dev/null || true
+
+set +e
+bash /testbed/eval.sh 2>&1 | tee /logs/verifier/phase2_output.log
+set -e
+
+# Merge logs
+cat /logs/verifier/phase1_output.log /logs/verifier/phase2_output.log > /logs/verifier/test_output.log
+
+# Judge Phase 2: should resolve (tests should pass with code patch)
+set +e
+python3 /tests/judge_testcase.py /logs/verifier/phase2_output.log {{ language }}
+phase2_resolved=$?
+set -e
+
+if [ "${phase2_resolved}" -eq 0 ]; then
+    echo "PASSED: Both phases succeeded -- tests correctly detect the bug and pass after fix"
+    echo 1 > /logs/verifier/script_reward.txt
+else
+    echo "FAILED: Phase 2 tests failed (tests don't pass even with code patch applied)"
+    echo 0 > /logs/verifier/script_reward.txt
+fi
+
+SCRIPT_REWARD=$(cat /logs/verifier/script_reward.txt 2>/dev/null || echo "0")
+# Write Harbor reward now (script_reward is the primary reward)
+echo "$SCRIPT_REWARD" > /logs/verifier/reward.txt
+
+exit "${phase2_resolved}"
+{% endif %}

@@ -1,0 +1,26 @@
+#!/bin/bash
+set -uo pipefail
+mkdir -p /logs/artifacts /logs/verifier
+
+# 1. 脚本测试（限时 {{ script_eval_timeout }}s，不阻塞后续 eval_agent）
+set +e
+timeout -s KILL {{ script_eval_timeout }} bash /tests/script_eval.sh 2>&1 | tee /logs/verifier/script_eval.log
+script_exit=${PIPESTATUS[0]}
+set -e
+
+if [ "$script_exit" -eq 124 ]; then
+  echo "[test.sh] script_eval.sh timed out after {{ script_eval_timeout }}s" | tee -a /logs/verifier/script_eval.log
+fi
+echo "[test.sh] script_eval.sh exited with ${script_exit}" | tee -a /logs/verifier/script_eval.log
+# 兜底：timeout 可能在 script_eval 写 reward 前 kill 进程
+[ -f /logs/verifier/script_reward.txt ] || echo "0" > /logs/verifier/script_reward.txt
+[ -f /logs/verifier/reward.txt ] || echo "0" > /logs/verifier/reward.txt
+
+{% if eval_model != "none" %}
+# 2. Agent 评测（无论脚本结果如何都运行；写独立日志）
+bash /tests/agent_eval.sh 2>&1 | tee /logs/verifier/agent_eval.log || true
+
+echo "[test.sh] agent_eval.sh done" | tee -a /logs/verifier/agent_eval.log
+{% endif %}
+
+exit "${script_exit}"

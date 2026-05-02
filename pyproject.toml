@@ -1,0 +1,46 @@
+[project]
+name = "swe-cycle"
+version = "1.0.0"
+description = "SWE-Cycle — Multi-dimensional AI Agent evaluation framework based on Harbor."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # --- Harbor 框架（本地子目录，会带入大部分依赖） ---
+    "harbor",
+
+    # --- 根目录脚本直接依赖 ---
+    "docker>=7.1.0",
+    "jinja2>=3.1.6",
+    "tqdm>=4.67.0",
+    "datasets==4.8.2",
+
+    # --- swebench harness/collect 额外依赖（harbor 未覆盖的） ---
+    "unidiff>=0.7.5",
+    "beautifulsoup4>=4.12.0",
+    "python-dotenv>=1.0.0",
+    "ghapi>=1.0.4",
+    "GitPython>=3.1.40",
+
+    # --- 版本约束：锁定 C/Rust 编译包到有 manylinux wheel 的版本 ---
+    "tiktoken>=0.11.0,<0.12.0",
+    "pyroaring==1.0.3",
+    "numpy==1.26.4",
+    "scipy==1.16.3",
+    "pandas==2.3.2",
+    "pyarrow==20.0.0",
+]
+
+[tool.uv.sources]
+harbor = { path = "harbor", editable = true }
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]  # 根目录本身不作为包分发，仅用于依赖管理
+
+[tool.uv]
+# datasets 4.8.2 声明 pyarrow>=21，但 pyarrow 20 实际兼容且有预编译 wheel；
+# pyarrow>=21 在低版本 GCC 机器上无法从源码构建。
+override-dependencies = ["pyarrow==20.0.0"]

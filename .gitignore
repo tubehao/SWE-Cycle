@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+harbor_tasks/
+harbor_output/
+results/
+*.log
+.claude/

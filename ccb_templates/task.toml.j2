@@ -1,0 +1,18 @@
+[metadata]
+author_name = "swe-cycle"
+author_email = "unknown"
+difficulty = "{{ difficulty }}"
+category = "{{ problem_type }}"
+tags = ["swe-cycle", "{{ problem_type | lower }}"]
+
+[verifier]
+timeout_sec = {{ verifier_timeout }}
+
+[agent]
+timeout_sec = {{ agent_timeout }}
+
+[environment]
+build_timeout_sec = {{ build_timeout }}
+cpus = 1
+memory = '4G'
+storage = '10G'

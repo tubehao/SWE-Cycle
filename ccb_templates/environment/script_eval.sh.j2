@@ -1,0 +1,230 @@
+#!/bin/bash
+set -euo pipefail
+
+mkdir -p /logs/artifacts /logs/verifier
+
+{% if benchmark == "pro" %}
+# ======= SWE-bench Pro evaluation path =======
+# Pro Environment: agent configured env, now run tests using per-instance scripts
+WORKDIR="{{ workdir }}"
+
+# ── Record agent's work ──────────────────────────────────────────────────────
+cd "$WORKDIR"
+git add -A
+git diff --cached HEAD > /logs/artifacts/prediction.diff 2>/dev/null || true
+cp /logs/artifacts/prediction.diff "$WORKDIR/agent.patch" 2>/dev/null || true
+
+# ── Restore patch files to initial_state (agent may have modified them) ───────
+cd "$WORKDIR"
+if [ -f /tests/code_patch.diff ]; then
+    _CP_FILES=$(grep '^diff --git' /tests/code_patch.diff | sed 's|diff --git a/\(.*\) b/.*|\1|' || true)
+    if [ -n "$_CP_FILES" ]; then
+        echo "$_CP_FILES" | xargs git checkout initial_state -- 2>/dev/null || true
+    fi
+fi
+if [ -f /tests/test_patch.diff ]; then
+    _TP_FILES=$(grep '^diff --git' /tests/test_patch.diff | sed 's|diff --git a/\(.*\) b/.*|\1|' || true)
+    if [ -n "$_TP_FILES" ]; then
+        echo "$_TP_FILES" | xargs git checkout initial_state -- 2>/dev/null || true
+    fi
+fi
+
+# ── Script evaluation ─────────────────────────────────────────────────────────
+cd "$WORKDIR"
+{% if before_repo_set_cmd %}
+{{ before_repo_set_cmd }}
+{% endif %}
+set +e
+bash /tests/run_script.sh {{ selected_test_files }} > /logs/verifier/stdout.log 2> /logs/verifier/stderr.log
+set -e
+
+# Parse results using per-instance parser
+python3 /tests/parser.py /logs/verifier/stdout.log /logs/verifier/stderr.log /logs/verifier/output.json
+
+# Check results against F2P/P2P and write reward
+set +e
+python3 - <<'CHECK_EOF'
+import json, sys, ast
+
+with open("/tests/config.json") as f:
+    datum = json.load(f)
+with open("/logs/verifier/output.json") as f:
+    output = json.load(f)
+
+passed = {t["name"] for t in output.get("tests", []) if t["status"] == "PASSED"}
+
+def parse_tests(test_data):
+    """Parse F2P/P2P field — handles JSON strings, Python literal strings, and lists."""
+    if isinstance(test_data, str):
+        try:
+            return json.loads(test_data)
+        except json.JSONDecodeError:
+            pass
+        try:
+            return ast.literal_eval(test_data)
+        except (ValueError, SyntaxError):
+            return []
+    elif isinstance(test_data, list):
+        return test_data
+    return []
+
+f2p = set(parse_tests(datum.get("FAIL_TO_PASS") or datum.get("fail_to_pass") or []))
+p2p = set(parse_tests(datum.get("PASS_TO_PASS") or datum.get("pass_to_pass") or []))
+
+resolved = (f2p | p2p) <= passed
+print("RESOLVED" if resolved else "NOT RESOLVED")
+with open("/logs/verifier/script_reward.txt", "w") as f:
+    f.write("1" if resolved else "0")
+with open("/logs/verifier/reward.txt", "w") as f:
+    f.write("1" if resolved else "0")
+sys.exit(0 if resolved else 1)
+CHECK_EOF
+exit_code=$?
+set -e
+
+exit "${exit_code}"
+
+{% else %}
+# ======= swebench evaluation path =======
+WORKDIR="/testbed"
+
+# ── Record agent's work ──────────────────────────────────────────────────────
+cd /testbed
+git add -A
+git diff --cached HEAD > /logs/artifacts/prediction.diff 2>/dev/null || true
+cp /logs/artifacts/prediction.diff /testbed/agent.patch 2>/dev/null || true
+
+# ── Script evaluation ─────────────────────────────────────────────────────────
+mkdir -p /logs/verifier
+
+{% if language == "py" %}
+source /opt/miniconda3/bin/activate
+if ! conda activate testbed 2>/dev/null; then
+    echo "[ERROR] conda env 'testbed' not found. Agent was required to create a conda environment named 'testbed' via setup.sh." >&2
+    echo "0" > /logs/verifier/script_reward.txt
+    echo "0" > /logs/verifier/reward.txt
+    exit 1
+fi
+{% endif %}
+
+# ── Restore patch files to initial_state (agent may have modified them) ───────
+cd /testbed
+if [ -f /tests/code_patch.diff ]; then
+    _CP_FILES=$(grep '^diff --git' /tests/code_patch.diff | sed 's|diff --git a/\(.*\) b/.*|\1|' || true)
+    if [ -n "$_CP_FILES" ]; then
+        echo "$_CP_FILES" | xargs git checkout initial_state -- 2>/dev/null || true
+    fi
+fi
+if [ -f /tests/test_patch.diff ]; then
+    _TP_FILES=$(grep '^diff --git' /tests/test_patch.diff | sed 's|diff --git a/\(.*\) b/.*|\1|' || true)
+    if [ -n "$_TP_FILES" ]; then
+        echo "$_TP_FILES" | xargs git checkout initial_state -- 2>/dev/null || true
+    fi
+fi
+
+# Run tests — disable errexit (-e) and nounset (-u) around test_commands.
+# * -e: so test failures don't kill this script before parser.py writes reward.txt
+# * -u: test_commands exports LOG_FILE partway through; referencing it afterwards
+#        (in the uv run line) would trigger "unbound variable" if -u stayed on.
+# LOG_FILE must stay in the current shell (not a subshell) so the parser can see it.
+set +eu
+{{ test_commands }}
+_test_exit=$?
+set -eu
+
+cd ..
+cat > parser.py <<'PARSER_EOF'
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["swebench==4.0.3", "datasets==2.16.1", "fastcore<1.11"]
+# ///
+
+import sys
+import json
+import os
+from swebench.harness.test_spec.test_spec import make_test_spec
+from swebench.harness.constants import EvalType, PASS_TO_PASS, \
+                                       FAIL_TO_PASS, KEY_INSTANCE_ID, \
+                                       FAIL_ONLY_REPOS, START_TEST_OUTPUT, END_TEST_OUTPUT
+from swebench.harness.grading import get_logs_eval, \
+                                     get_eval_tests_report, \
+                                     compute_fail_to_pass, \
+                                     compute_pass_to_pass
+
+with open("/tests/config.json", "r") as file:
+    datum = json.load(file)
+
+test_spec   = make_test_spec(datum)
+report_map = {}
+instance_id = datum[KEY_INSTANCE_ID]
+report_map[instance_id] = {
+    "patch_is_None": False,
+    "patch_exists": False,
+    "patch_successfully_applied": False,
+    "resolved": False,
+}
+report_map[instance_id]["patch_exists"] = True
+# test_commands already writes '>>>>> Start/End Test Output' markers via set -x trace.
+# Do NOT re-wrap: prepending another START marker would cause a double-split bug.
+test_log_path = os.environ["LOG_FILE"]
+
+eval_status_map, found = get_logs_eval(test_spec, test_log_path)
+if found:
+    report_map[instance_id]["patch_successfully_applied"] = True
+
+    eval_ref = {
+        KEY_INSTANCE_ID: test_spec.instance_id,
+        FAIL_TO_PASS: test_spec.FAIL_TO_PASS,
+        PASS_TO_PASS: test_spec.PASS_TO_PASS,
+    }
+
+    eval_type = EvalType.FAIL_ONLY if test_spec.repo in FAIL_ONLY_REPOS \
+        else EvalType.PASS_AND_FAIL
+
+    report = get_eval_tests_report(
+        eval_status_map, eval_ref, eval_type=eval_type
+    )
+    # Resolved = all F2P tests pass (P2P failures may be due to pre-existing
+    # env issues unrelated to the agent's change, so we do not penalise them).
+    f2p_score = compute_fail_to_pass(report)
+    p2p_score = compute_pass_to_pass(report)
+    report_map[instance_id]["f2p_score"] = f2p_score
+    report_map[instance_id]["p2p_score"] = p2p_score
+    if f2p_score == 1.0:
+        report_map[instance_id]["resolved"] = True
+    report_map[instance_id]["tests_status"] = report
+
+json.dump(report_map, open("/logs/verifier/report.json", "w"), indent=4)
+
+print(f"SWEBench results starts here")
+if report_map[instance_id]["resolved"]:
+    print("PASSED")
+else:
+    print("FAILED")
+print("SWEBench results ends here")
+
+resolved = report_map[instance_id]["resolved"]
+with open("/logs/verifier/script_reward.txt", "w") as f:
+    f.write("1" if resolved else "0")
+with open("/logs/verifier/reward.txt", "w") as f:
+    f.write("1" if resolved else "0")
+sys.exit(0 if resolved else 1)
+PARSER_EOF
+
+chmod +x parser.py
+
+set +e
+export PATH="/root/.local/bin:$PATH"
+export UV_HTTP_TIMEOUT=600
+export UV_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+# LOG_FILE is exported by test_commands; fall back to a default if it wasn't set
+# (e.g. test_commands exited early before reaching the export line).
+LOG_FILE="${LOG_FILE:-/logs/verifier/test_output.log}"
+export LOG_FILE
+uv run --no-project parser.py | tee -a "$LOG_FILE"
+exit_code=$?
+set -e
+
+exit "${exit_code}"
+{% endif %}
