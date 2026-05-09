@@ -95,6 +95,3 @@ This project builds upon the following open-source assets:
 
 All source datasets are derived from publicly available GitHub repositories under their respective open-source licenses. Our benchmark instances consist of metadata (commit hashes, issue descriptions, test patches) referencing these repositories and do not redistribute proprietary code.
 
-## License
-
-MIT
