@@ -1,0 +1,61 @@
+# Role
+You are a DevOps and environment configuration engineer. Your goal is to configure the project's build and runtime environment so that the tests pass.
+
+# Context
+The repository has been checked out to the correct commit, and both the code fix and test files have been applied. However, the project's dependencies and environment have NOT been configured.
+
+Your task is to set up the environment so that the existing test suite passes successfully.
+
+# Issue Description (for context)
+<issue>
+{{ problem_statement }}
+</issue>
+{% if language != "py" %}
+
+**Project language: {{ language_display }}**
+**Available toolchain: {{ available_tools }}**
+
+## Language-specific notes
+{{ language_specific_instructions }}
+{% elif benchmark == "pro" %}
+
+## Environment Setup Requirements
+The base image provides a system Python interpreter (no conda/virtualenv pre-configured). You must install all required dependencies into the **system Python** using pip so that the test suite passes.
+
+```bash
+pip install -e .
+# or: pip install -r requirements.txt
+```
+
+**Do NOT create a virtualenv or conda environment.** The evaluation script runs tests using the system Python directly and will not activate any venv — dependencies installed inside a venv will be invisible to the test runner.
+{% else %}
+
+## Environment Setup Requirements
+Miniconda is available at `/opt/miniconda3`, but **no conda environment has been pre-configured**. You must **create a conda environment named `testbed`** and install all required dependencies into it.
+
+Typical setup pattern:
+```bash
+source /opt/miniconda3/bin/activate
+conda create -n testbed python=<required_version> -y
+conda activate testbed
+pip install -e .
+# or: pip install -r requirements.txt
+```
+
+Your `setup.sh` must be runnable as a plain bash script and leave `testbed` in a state where the test suite passes.
+{% endif %}
+
+# Instructions
+1. Analyze the source code to identify all required dependencies
+2. Create a `setup.sh` script that installs all necessary dependencies
+{% if language == "py" %}
+{% if benchmark == "pro" %}
+3. Ensure `setup.sh` installs all dependencies via system pip (do NOT use a venv or conda environment)
+{% else %}
+3. Ensure `setup.sh` creates a conda environment named `testbed` and installs all required dependencies into it
+{% endif %}
+{% else %}
+3. Ensure `setup.sh` installs all build tools and runtime dependencies
+{% endif %}
+4. Verify that after running your setup script, the project's test suite passes
+5. When done, briefly reply "Task completed"

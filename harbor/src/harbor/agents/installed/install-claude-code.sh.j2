@@ -1,0 +1,57 @@
+#!/bin/bash
+set -euo pipefail
+
+# Install system dependencies
+if command -v apk &> /dev/null; then
+    apk add --no-cache curl bash nodejs npm
+elif command -v apt-get &> /dev/null; then
+    apt-get update && apt-get install -y curl ca-certificates gnupg
+elif command -v yum &> /dev/null; then
+    yum install -y curl
+else
+    echo "Warning: No known package manager found" >&2
+fi
+
+# Ensure Node.js >= 18 is available (Claude Code requires it)
+NODE_OK=false
+if command -v node &> /dev/null; then
+    NODE_MAJOR=$(node -v 2>/dev/null | sed 's/v//' | cut -d. -f1)
+    if [ "$NODE_MAJOR" -ge 18 ] 2>/dev/null; then
+        NODE_OK=true
+        echo "Found Node.js $(node -v), OK"
+    fi
+fi
+
+if [ "$NODE_OK" = false ]; then
+    echo "Node.js >= 18 not found, installing..."
+    if command -v conda &> /dev/null; then
+        # Use conda if available (common in swebench containers)
+        echo "Installing Node.js 20 via conda..."
+        conda install -y -c conda-forge nodejs=20
+    elif command -v apt-get &> /dev/null; then
+        # Install Node.js 20 via NodeSource PPA
+        echo "Installing Node.js 20 via NodeSource..."
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+        apt-get update && apt-get install -y nodejs
+    elif command -v yum &> /dev/null; then
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+        yum install -y nodejs
+    fi
+fi
+
+node --version
+npm --version
+
+# Install Claude Code via npm (avoids curl claude.ai region restrictions)
+{% if version %}
+npm install -g @anthropic-ai/claude-code@{{ version }}
+{% else %}
+npm install -g @anthropic-ai/claude-code
+{% endif %}
+
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+export PATH="$HOME/.local/bin:$PATH"
+claude --version

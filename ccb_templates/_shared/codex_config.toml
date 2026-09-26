@@ -1,0 +1,7 @@
+[model_providers.default]
+name = "Default"
+base_url = "${OPENAI_BASE_URL}"
+env_key = "OPENAI_API_KEY"
+
+model_provider = "default"
+model = "gpt-5.4"

@@ -1,0 +1,126 @@
+{% if benchmark == "pro" %}
+# ======= SWE-bench Pro path =======
+FROM {{ pro_image }}
+
+# Reset entrypoint to allow docker-compose command (sleep infinity) to run
+ENTRYPOINT []
+
+WORKDIR {{ workdir }}
+
+# Set PYTHONPATH to use /app/lib first so patches are loaded
+ENV PYTHONPATH={{ workdir }}/lib:{{ workdir }}
+
+# Prepare environment: reset to base_commit
+{% if before_repo_set_cmd_docker %}
+RUN set -e && {{ before_repo_set_cmd_docker }}
+{% endif %}
+
+# Strip pre-installed project dependencies so the agent must configure the environment from scratch
+{% if language == "py" %}
+RUN pip freeze | grep -v "^-e" | grep -vE "^(pip|setuptools|wheel|pkg.resources)==" \
+    | xargs pip uninstall -y 2>/dev/null || true && \
+    find /usr/lib/python*/dist-packages /usr/local/lib/python*/dist-packages \
+        -maxdepth 1 \( -name "*.egg-info" -o -name "*.dist-info" \) \
+        ! -name "pip*" ! -name "setuptools*" ! -name "wheel*" \
+        -exec rm -rf {} + 2>/dev/null || true
+{% elif language == "go" %}
+RUN rm -rf /root/go/pkg/mod /go/pkg/mod {{ workdir }}/vendor /root/go/bin/* 2>/dev/null || true
+{% elif language in ["js", "ts"] %}
+RUN find {{ workdir }} -name "node_modules" -type d -prune -exec rm -rf '{}' + && \
+    npm cache clean --force 2>/dev/null || true && \
+    rm -rf /root/.cache/yarn /root/.npm/_cacache 2>/dev/null || true
+{% endif %}
+
+# Ensure curl and gpg are available (some base images lack them)
+RUN (command -v apt-get && apt-get update -qq && apt-get install -y -qq curl gnupg ca-certificates >/dev/null) || \
+    (command -v apk && apk add --no-cache curl gnupg ca-certificates) || true
+RUN rm -rf /var/lib/apt/lists/*
+
+# Install uv for running Python scripts
+RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh || true
+RUN mkdir -p /logs /tests
+
+# Copy solving agent's instruction into container
+COPY instruction.md {{ workdir }}/instruction.md
+
+# Pro: copy per-instance run_script and parser into /tests/
+{% if has_run_script %}
+COPY run_script.sh /tests/run_script.sh
+RUN chmod +x /tests/run_script.sh
+{% endif %}
+{% if has_parser %}
+COPY parser.py /tests/parser.py
+RUN chmod +x /tests/parser.py
+{% endif %}
+
+# Install OpenCode CLI for Eval Agent (pre-downloaded binary, version pinned v1.4.6)
+# Two binaries: glibc (Debian/Ubuntu) and musl (Alpine). Auto-detect at build time.
+COPY opencode /usr/local/bin/opencode-glibc
+COPY opencode-musl /usr/local/bin/opencode-musl
+RUN chmod +x /usr/local/bin/opencode-glibc /usr/local/bin/opencode-musl && \
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then \
+        ln -sf /usr/local/bin/opencode-musl /usr/local/bin/opencode; \
+    else \
+        ln -sf /usr/local/bin/opencode-glibc /usr/local/bin/opencode; \
+    fi
+
+# Ensure git user is configured
+RUN git config --global user.email "setup@swebench.config" && \
+    git config --global user.name "SWE-bench"
+
+# Create initial commit and tag base_commit (used for TEST_DYNAMIC reversal later)
+# Disable git hooks (husky/commitlint) that exist in some JS/TS repos (e.g. protonmail__webclients)
+RUN cd {{ workdir }} && \
+    git config core.hooksPath /dev/null && \
+    HUSKY=0 git add -A && \
+    HUSKY=0 git commit --allow-empty --no-verify -am "initial state" && \
+    git tag base_commit
+
+{% else %}
+# ======= swebench path (existing) =======
+FROM {{ base_image }}
+
+# Ensure curl and gpg are available (some base images lack them)
+RUN (command -v apt-get && apt-get update -qq && apt-get install -y -qq curl gnupg ca-certificates >/dev/null) || \
+    (command -v apk && apk add --no-cache curl gnupg ca-certificates) || true
+RUN rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh
+RUN mkdir -p /logs
+
+# Run swebench's setup_repo.sh to clone repo and checkout commit
+# For FullPipe type, we use the base image (no deps) - agent does everything
+# (no conda activate / install — agent handles that)
+COPY setup_repo.sh /root/setup_repo.sh
+RUN sed -i -e 's/\r$//' /root/setup_repo.sh
+RUN /bin/bash /root/setup_repo.sh
+
+WORKDIR /testbed
+
+# Copy solving agent's instruction into container
+COPY instruction.md /testbed/instruction.md
+RUN mkdir -p /tests
+
+# Install OpenCode CLI for Eval Agent (pre-downloaded binary, version pinned v1.4.6)
+# Two binaries: glibc (Debian/Ubuntu) and musl (Alpine). Auto-detect at build time.
+COPY opencode /usr/local/bin/opencode-glibc
+COPY opencode-musl /usr/local/bin/opencode-musl
+RUN chmod +x /usr/local/bin/opencode-glibc /usr/local/bin/opencode-musl && \
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then \
+        ln -sf /usr/local/bin/opencode-musl /usr/local/bin/opencode; \
+    else \
+        ln -sf /usr/local/bin/opencode-glibc /usr/local/bin/opencode; \
+    fi
+
+# Ensure git user is configured (setup_repo.sh may be truncated for FullPipe type)
+RUN git config --global user.email "setup@swebench.config" && \
+    git config --global user.name "SWE-bench"
+
+# Create initial commit and tag base_commit (used for TEST_DYNAMIC reversal later)
+# Disable git hooks (husky/commitlint) that exist in some JS/TS repos
+RUN cd /testbed && \
+    git config core.hooksPath /dev/null && \
+    HUSKY=0 git add -A && \
+    HUSKY=0 git commit --allow-empty --no-verify -am "initial state" && \
+    git tag base_commit
+{% endif %}

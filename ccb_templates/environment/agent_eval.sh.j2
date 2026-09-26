@@ -1,0 +1,392 @@
+#!/bin/bash
+set -euo pipefail
+export PATH="/root/.local/bin:$PATH"
+
+mkdir -p /logs/artifacts /logs/verifier
+
+# ── 上下文隔离：清除 solving agent 留下的 opencode 会话数据 ────────────────────
+rm -rf /root/.local/share/opencode 2>/dev/null || true
+rm -rf /root/.config/opencode/sessions 2>/dev/null || true
+
+# ── 写入 eval agent 的 opencode 配置（运行时生成，不依赖 Docker image）────────────
+mkdir -p /root/.config/opencode
+printf '{\n  "model": "customproxy/{{ opencode_model }}",\n  "permission": "allow",\n  "provider": {\n    "customproxy": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "Default",\n      "options": {\n        "baseURL": "'$OPENAI_BASE_URL'",\n        "apiKey": "{{ opencode_api_key }}"\n      },\n      "models": {\n        "{{ opencode_model }}": {\n          "name": "Eval Model",\n          "limit": { "context": 200000, "output": 65536 }\n        }\n      }\n    }\n  }\n}\n' > /root/.config/opencode/opencode.json
+
+{% set WORKDIR = workdir if benchmark == "pro" else "/testbed" %}
+
+{% if ablation_eval_models %}
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 0: Prepare (ablation eval models mode)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SCRIPT_REWARD=$(cat /logs/verifier/script_reward.txt 2>/dev/null || echo "null")
+
+# Ensure agent.patch exists
+cp /logs/artifacts/prediction.diff {{ WORKDIR }}/agent.patch 2>/dev/null || true
+
+{% if benchmark != "pro" %}
+# Re-apply test_patch
+if [ -f /tests/test_patch.diff ]; then
+  cd /testbed
+  git apply /tests/test_patch.diff 2>/dev/null || git apply --3way /tests/test_patch.diff 2>/dev/null || true
+fi
+{% endif %}
+
+# Provide eval context
+mkdir -p {{ WORKDIR }}/eval_context
+cp /tests/script_eval.sh {{ WORKDIR }}/eval_context/script_eval.sh 2>/dev/null || true
+cp /logs/verifier/script_eval.log {{ WORKDIR }}/eval_context/script_eval.log 2>/dev/null || true
+cp /tests/eval_prompt.md {{ WORKDIR }}/eval_prompt.md 2>/dev/null || true
+
+# Copy workdirs for each additional model (model 0 reuses original WORKDIR)
+echo "[agent_eval] Ablation mode: copying workdirs for {{ ablation_eval_models | length }} eval models..."
+COPY_START=$(date +%s)
+{% for model in ablation_eval_models %}
+{% if not loop.first %}
+cp -a {{ WORKDIR }} {{ WORKDIR }}_model_{{ loop.index0 }}
+{% endif %}
+{% endfor %}
+COPY_END=$(date +%s)
+echo "[agent_eval] Copy took $((COPY_END - COPY_START))s"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1: Run {{ ablation_eval_models | length }} eval agents in parallel
+# ══════════════════════════════════════════════════════════════════════════════
+
+EVAL_AGENT_TIMEOUT={{ eval_agent_timeout }}
+EVAL_START=$(date +%s)
+
+{% for model in ablation_eval_models %}
+{% set MDIR = WORKDIR if loop.first else WORKDIR ~ "_model_" ~ loop.index0 %}
+# ── Ablation Eval Agent {{ loop.index0 }}: {{ model }} ──
+(
+  export XDG_CONFIG_HOME=/tmp/eval_model_{{ loop.index0 }}_config
+  export XDG_DATA_HOME=/tmp/eval_model_{{ loop.index0 }}_data
+  rm -rf "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" 2>/dev/null || true
+  mkdir -p "$XDG_CONFIG_HOME/opencode"
+
+  printf '{\n  "model": "customproxy/{{ model }}",\n  "permission": "allow",\n  "provider": {\n    "customproxy": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "Default",\n      "options": {\n        "baseURL": "'$OPENAI_BASE_URL'",\n        "apiKey": "{{ opencode_api_key }}"\n      },\n      "models": {\n        "{{ model }}": {\n          "name": "Eval Model",\n          "limit": { "context": 200000, "output": 65536 }\n        }\n      }\n    }\n  }\n}\n' > "$XDG_CONFIG_HOME/opencode/opencode.json"
+
+  _TRACK_START=$(date +%s)
+  for _attempt in $(seq 1 3); do
+    if [ $_attempt -gt 1 ]; then
+      rm -rf "$XDG_DATA_HOME" 2>/dev/null || true
+      mkdir -p "$XDG_DATA_HOME"
+    fi
+    _now=$(date +%s)
+    _remaining=$((EVAL_AGENT_TIMEOUT - (_now - _TRACK_START)))
+    if [ $_remaining -lt 120 ]; then
+      echo "[RETRY] Ablation {{ loop.index0 }} ({{ model }}): only ${_remaining}s remaining, skipping retry"
+      break
+    fi
+    OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000 timeout ${_remaining} opencode run @eval_prompt.md \
+      --dir {{ MDIR }} \
+      2>&1 | tee {{ MDIR }}/eval_last_message.txt
+    _exit_code=${PIPESTATUS[0]}
+    if [ $_exit_code -eq 0 ] || [ -f "{{ MDIR }}/eval_result.json" ]; then break; fi
+    if [ $_exit_code -eq 124 ]; then break; fi
+    if [ $_attempt -lt 3 ]; then
+      _backoff=$((60 * _attempt))
+      echo "[RETRY] Ablation {{ loop.index0 }} ({{ model }}) attempt $_attempt/3 failed (exit=$_exit_code), retrying in ${_backoff}s..."
+      sleep $_backoff
+    fi
+  done
+) > /logs/artifacts/eval_trajectory_model_{{ loop.index0 }}.txt 2>&1 &
+ablation_pid_{{ loop.index0 }}=$!
+
+{% endfor %}
+
+# Wait for all ablation agents to finish
+set +e
+{% for model in ablation_eval_models %}
+wait $ablation_pid_{{ loop.index0 }} 2>/dev/null
+ablation_exit_{{ loop.index0 }}=$?
+{% endfor %}
+set -e
+
+EVAL_END=$(date +%s)
+EVAL_ELAPSED=$((EVAL_END - EVAL_START))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2: Collect artifacts
+# ══════════════════════════════════════════════════════════════════════════════
+
+{% for model in ablation_eval_models %}
+{% set MDIR = WORKDIR if loop.first else WORKDIR ~ "_model_" ~ loop.index0 %}
+cp {{ MDIR }}/eval_result.json /logs/artifacts/eval_result_model_{{ loop.index0 }}.json 2>/dev/null || true
+cp {{ MDIR }}/eval_last_message.txt /logs/artifacts/eval_last_message_model_{{ loop.index0 }}.txt 2>/dev/null || true
+{% endfor %}
+
+# Backward compatibility
+cp /logs/artifacts/eval_result_model_0.json /logs/artifacts/eval_result.json 2>/dev/null || true
+cp /logs/artifacts/eval_trajectory_model_0.txt /logs/artifacts/eval_trajectory.txt 2>/dev/null || true
+
+{% for model in ablation_eval_models %}
+if [ $ablation_exit_{{ loop.index0 }} -eq 124 ]; then
+  echo "[WARN] Ablation eval agent {{ loop.index0 }} ({{ model }}) timed out after ${EVAL_AGENT_TIMEOUT}s"
+fi
+{% endfor %}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3: Parse scores and write result.json
+# ══════════════════════════════════════════════════════════════════════════════
+
+(cd /tests && uv run --no-project python3 -c "
+import re, os, json
+
+def parse_eval_result(result_path, last_msg_path):
+    text = open(last_msg_path).read() if os.path.exists(last_msg_path) else ''
+
+    static_score  = None
+    dynamic_score = None
+    total_score   = None
+    max_score     = None
+    score_ratio   = None
+
+    if os.path.exists(result_path):
+        try:
+            er = json.load(open(result_path))
+            _upper = {
+                'STATIC_SCORE': 'static_score', 'DYNAMIC_SCORE': 'dynamic_score',
+                'TOTAL_SCORE': 'total_score', 'MAX_SCORE': 'max_score',
+                'SCORE_RATIO': 'score_ratio',
+                'STATIC_ANALYSIS_SCORE': 'static_score',
+                'DYNAMIC_EXECUTION_SCORE': 'dynamic_score',
+            }
+            for uk, lk in _upper.items():
+                if uk in er and lk not in er:
+                    er[lk] = er[uk]
+            static_score     = er.get('static_score')
+            dynamic_score    = er.get('dynamic_score')
+            total_score      = er.get('total_score')
+            max_score        = er.get('max_score')
+            score_ratio      = er.get('score_ratio')
+            if score_ratio is None:
+                for key in ('evaluation', 'result', 'scores'):
+                    nested = er.get(key)
+                    if isinstance(nested, dict):
+                        if score_ratio is None:
+                            score_ratio = nested.get('score_ratio')
+                        if static_score is None:
+                            static_score = nested.get('static_score') or (nested.get('static_analysis', {}).get('score') if isinstance(nested.get('static_analysis'), dict) else None)
+                        if dynamic_score is None:
+                            dynamic_score = nested.get('dynamic_score') or (nested.get('dynamic_execution', {}).get('score') if isinstance(nested.get('dynamic_execution'), dict) else None)
+                        if total_score is None:
+                            total_score = nested.get('total_score')
+                        if max_score is None:
+                            max_score = nested.get('max_score') or nested.get('max_total_score')
+        except Exception:
+            pass
+
+    if score_ratio is None:
+        m = re.search(r'\*{0,2}SCORE_RATIO\*{0,2}:?\*{0,2}\s*([0-9]+(?:\.[0-9]+)?)', text, re.IGNORECASE)
+        if m:
+            score_ratio = round(float(m.group(1)), 4)
+
+    return {
+        'static_score': static_score,
+        'dynamic_score': dynamic_score,
+        'total_score': total_score,
+        'max_score': max_score if max_score is not None else 4,
+        'score_ratio': score_ratio,
+    }
+
+models = {{ ablation_eval_models | tojson }}
+script_reward = None if '$SCRIPT_REWARD' == 'null' else int('$SCRIPT_REWARD')
+
+ablation_eval_results = {}
+for i, model in enumerate(models):
+    if i == 0:
+        workdir = '{{ WORKDIR }}'
+    else:
+        workdir = '{{ WORKDIR }}' + f'_model_{i}'
+    result = parse_eval_result(
+        os.path.join(workdir, 'eval_result.json'),
+        os.path.join(workdir, 'eval_last_message.txt'),
+    )
+    ablation_eval_results[model] = result
+
+# Use first model's score_ratio as agent_reward
+first_model = models[0]
+first_result = ablation_eval_results[first_model]
+agent_reward = round(float(first_result['score_ratio']), 4) if first_result['score_ratio'] is not None else None
+agent_eval_status = 'ok' if agent_reward is not None else 'failed'
+
+r = {
+    'instance_id':       '{{ instance_id }}',
+    'task_type':         'environment',
+    'script_reward':     script_reward,
+    'agent_reward':      agent_reward,
+    'agent_eval_status': agent_eval_status,
+    'ablation_eval_results': {
+        model: {
+            'static_score':  res['static_score'],
+            'dynamic_score': res['dynamic_score'],
+            'total_score':   res['total_score'],
+            'max_score':     res['max_score'],
+            'score_ratio':   res['score_ratio'],
+        }
+        for model, res in ablation_eval_results.items()
+    },
+    'ablation_models':   models,
+    'execution_time':    float($EVAL_ELAPSED),
+}
+json.dump(r, open('{{ WORKDIR }}/result.json', 'w'), indent=2)
+json.dump(r, open('/logs/artifacts/result.json', 'w'), indent=2)
+print('result.json written:', json.dumps(r, indent=2))
+
+# Write reward.txt for Harbor Verifier
+if agent_reward is not None:
+    open('/logs/verifier/reward.txt', 'w').write(str(agent_reward))
+    print(f'reward.txt written: {agent_reward}')
+else:
+    print('[WARN] agent_reward is None, not writing reward.txt')
+") || { echo "[WARN] result.json write failed"; }
+
+{% else %}
+
+SCRIPT_REWARD=$(cat /logs/verifier/script_reward.txt 2>/dev/null || echo "null")
+
+# ── Ensure agent.patch exists (copy from prediction.diff written by script_eval) ───
+cp /logs/artifacts/prediction.diff {{ WORKDIR }}/agent.patch 2>/dev/null || true
+
+{% if benchmark != "pro" %}
+# ── Re-apply test_patch so eval agent sees the same test assertions as script_eval ──
+# script_eval.sh's test_commands ends with: git checkout <base_commit> -- <test_files>
+# which resets test files to base state (removing test_patch assertions).
+# Re-apply here so eval agent can verify tests pass after the agent's env configuration.
+if [ -f /tests/test_patch.diff ]; then
+  cd /testbed
+  git apply /tests/test_patch.diff 2>/dev/null || git apply --3way /tests/test_patch.diff 2>/dev/null || true
+fi
+{% endif %}
+
+# ── Provide eval context: script_eval.sh and its run log ──────────────────────
+mkdir -p {{ WORKDIR }}/eval_context
+cp /tests/script_eval.sh {{ WORKDIR }}/eval_context/script_eval.sh 2>/dev/null || true
+cp /logs/verifier/script_eval.log {{ WORKDIR }}/eval_context/script_eval.log 2>/dev/null || true
+
+# ── Eval Agent ────────────────────────────────────────────────────────────────
+# eval_prompt.md is pre-rendered at task generation time, placed in tests_dir,
+# and injected by Verifier upload_dir to /tests/ after agent runs.
+# Copy to WORKDIR so opencode @file resolves relative to --dir correctly
+cp /tests/eval_prompt.md {{ WORKDIR }}/eval_prompt.md 2>/dev/null || true
+
+EVAL_AGENT_TIMEOUT={{ eval_agent_timeout }}
+EVAL_START=$(date +%s)
+set +e
+for _attempt in $(seq 1 3); do
+  if [ $_attempt -gt 1 ]; then
+    rm -rf /root/.local/share/opencode 2>/dev/null || true
+  fi
+  _now=$(date +%s)
+  _remaining=$((EVAL_AGENT_TIMEOUT - (_now - EVAL_START)))
+  if [ $_remaining -lt 120 ]; then
+    echo "[RETRY] Only ${_remaining}s remaining, skipping retry"
+    break
+  fi
+  OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000 timeout ${_remaining} opencode run @eval_prompt.md \
+    --dir {{ WORKDIR }} \
+    2>&1 | tee {{ WORKDIR }}/eval_last_message.txt > /logs/artifacts/eval_trajectory.txt
+  eval_agent_exit=${PIPESTATUS[0]}
+  if [ $eval_agent_exit -eq 0 ] || [ -f "{{ WORKDIR }}/eval_result.json" ]; then break; fi
+  if [ $eval_agent_exit -eq 124 ]; then break; fi
+  if [ $_attempt -lt 3 ]; then
+    _backoff=$((60 * _attempt))
+    echo "[RETRY] Attempt $_attempt/3 failed (exit=$eval_agent_exit), retrying in ${_backoff}s..."
+    sleep $_backoff
+  fi
+done
+set -e
+EVAL_END=$(date +%s)
+EVAL_ELAPSED=$((EVAL_END - EVAL_START))
+
+cp {{ WORKDIR }}/eval_last_message.txt /logs/artifacts/eval_last_message.txt 2>/dev/null || true
+cp {{ WORKDIR }}/eval_result.json /logs/artifacts/eval_result.json 2>/dev/null || true
+
+(cd /tests && uv run --no-project python3 -c "
+import re, os, json
+
+last_msg_path    = '{{ WORKDIR }}/eval_last_message.txt'
+eval_result_path = '{{ WORKDIR }}/eval_result.json'
+script_reward    = None if '$SCRIPT_REWARD' == 'null' else int('$SCRIPT_REWARD')
+text = open(last_msg_path).read() if os.path.exists(last_msg_path) else ''
+
+# ── Read structured fields from eval_result.json if present ──
+static_score  = None
+dynamic_score = None
+total_score   = None
+max_score     = None
+
+# eval_result.json 中的 score_ratio（优先级最高，最可靠）
+json_score_ratio = None
+
+if os.path.exists(eval_result_path):
+    try:
+        er = json.load(open(eval_result_path))
+        static_score     = er.get('static_score')
+        dynamic_score    = er.get('dynamic_score')
+        total_score      = er.get('total_score')
+        max_score        = er.get('max_score')
+        json_score_ratio = er.get('score_ratio')
+        # ── Fallback: eval agent 可能将字段嵌套在 evaluation/result/scores 内 ──
+        if json_score_ratio is None:
+            for key in ('evaluation', 'result', 'scores'):
+                nested = er.get(key)
+                if isinstance(nested, dict):
+                    if json_score_ratio is None:
+                        json_score_ratio = nested.get('score_ratio')
+                    if static_score is None:
+                        static_score = nested.get('static_score') or (nested.get('static_analysis', {}).get('score') if isinstance(nested.get('static_analysis'), dict) else None)
+                    if dynamic_score is None:
+                        dynamic_score = nested.get('dynamic_score') or (nested.get('dynamic_execution', {}).get('score') if isinstance(nested.get('dynamic_execution'), dict) else None)
+                    if total_score is None:
+                        total_score = nested.get('total_score')
+                    if max_score is None:
+                        max_score = nested.get('max_score') or nested.get('max_total_score')
+    except Exception:
+        pass
+
+# ── agent_reward（即 score_ratio float 0.0–1.0）解析 ──
+# 优先级：1) eval_result.json[\"score_ratio\"]  2) 文本正则提取 SCORE_RATIO:
+agent_reward      = None
+agent_eval_status = 'failed'
+
+if json_score_ratio is not None:
+    # 1) eval_result.json 中有明确 score_ratio（最可靠）
+    agent_reward      = round(float(json_score_ratio), 4)
+    agent_eval_status = 'ok'
+else:
+    # 2) 从文本中提取 SCORE_RATIO: 0.xx
+    m = re.search(r'\*{0,2}SCORE_RATIO\*{0,2}:?\*{0,2}\s*([0-9]+(?:\.[0-9]+)?)', text, re.IGNORECASE)
+    if m:
+        agent_reward      = round(float(m.group(1)), 4)
+        agent_eval_status = 'ok'
+
+# ── Three-state agreement（基于连续分方向对比）──
+def compute_agreement(script_r, agent_r, status):
+    if status != 'ok' or agent_r is None or script_r is None:
+        return None
+    if agent_r > script_r:  return 'agent_higher'
+    if agent_r < script_r:  return 'agent_lower'
+    return 'agree'
+
+r = {
+  'instance_id':       '{{ instance_id }}',
+  'task_type':         'environment',
+  'script_reward':     script_reward,
+  'agent_reward':      agent_reward,
+  'agent_eval_status': agent_eval_status,
+  'agreement':         compute_agreement(script_reward, agent_reward, agent_eval_status),
+  'static_score':      static_score,
+  'dynamic_score':     dynamic_score,
+  'total_score':       total_score,
+  'max_score':         max_score if max_score is not None else 4,
+  'execution_time':    float($EVAL_ELAPSED)
+}
+json.dump(r, open('{{ WORKDIR }}/result.json', 'w'), indent=2)
+json.dump(r, open('/logs/artifacts/result.json', 'w'), indent=2)
+print('result.json written:', r)
+") || { echo "[WARN] result.json write failed (reward.txt already written)"; }
+
+{% endif %}

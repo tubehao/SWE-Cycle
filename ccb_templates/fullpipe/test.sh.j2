@@ -1,0 +1,11 @@
+#!/bin/bash
+set -uo pipefail
+mkdir -p /logs/artifacts /logs/verifier
+
+{% if eval_model != "none" %}
+# FullPipe: agent eval only (no script eval track)
+bash /tests/agent_eval.sh 2>&1 | tee /logs/verifier/agent_eval.log
+{% else %}
+echo "0" > /logs/verifier/reward.txt
+echo "[test.sh] eval skipped (eval_model=none), reward=0"
+{% endif %}

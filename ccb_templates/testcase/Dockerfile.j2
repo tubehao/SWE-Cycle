@@ -1,0 +1,143 @@
+{% if benchmark == "pro" %}
+# ======= SWE-bench Pro path =======
+FROM {{ pro_image }}
+
+# Reset entrypoint to allow docker-compose command (sleep infinity) to run
+ENTRYPOINT []
+
+WORKDIR {{ workdir }}
+
+# Set PYTHONPATH to use /app/lib first so patches are loaded
+ENV PYTHONPATH={{ workdir }}/lib:{{ workdir }}
+
+# Prepare environment: reset to base_commit
+{% if before_repo_set_cmd_docker %}
+RUN set -e && {{ before_repo_set_cmd_docker }}
+{% endif %}
+
+# Ensure curl and gpg are available (some base images lack them)
+RUN (command -v apt-get && apt-get update -qq && apt-get install -y -qq curl gnupg ca-certificates >/dev/null) || \
+    (command -v apk && apk add --no-cache curl gnupg ca-certificates) || true
+RUN rm -rf /var/lib/apt/lists/*
+
+# Install uv for running Python scripts
+RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh || true
+RUN mkdir -p /logs /tests
+
+# Copy solving agent's instruction into container
+COPY instruction.md {{ workdir }}/instruction.md
+
+# Pro: copy per-instance run_script and parser into /tests/
+{% if has_run_script %}
+COPY run_script.sh /tests/run_script.sh
+RUN chmod +x /tests/run_script.sh
+{% endif %}
+{% if has_parser %}
+COPY parser.py /tests/parser.py
+RUN chmod +x /tests/parser.py
+{% endif %}
+
+# Copy language-aware test result judge
+COPY judge_testcase.py /tests/judge_testcase.py
+RUN chmod +x /tests/judge_testcase.py
+
+# Apply code_patch so agent sees fixed code and can write tests against it
+# Tag buggy_state before applying (for TEST_DYNAMIC Phase 1 reversal)
+# Tag fixed_state after applying (for TEST_DYNAMIC Phase 2 restore)
+{% if code_patch_file %}
+COPY {{ code_patch_file }} /tests/code_patch.diff
+RUN cd {{ workdir }} && \
+    git config --global user.email "setup@swebench.config" && \
+    git config --global user.name "SWE-bench" && \
+    git config core.hooksPath /dev/null && \
+    HUSKY=0 git add -A && HUSKY=0 git commit --allow-empty --no-verify -am "buggy state" && git tag buggy_state && \
+    git apply /tests/code_patch.diff && \
+    HUSKY=0 git add -A && HUSKY=0 git commit --allow-empty --no-verify -am "fixed state" && git tag fixed_state
+{% endif %}
+
+# Install OpenCode CLI for Eval Agent (pre-downloaded binary, version pinned v1.4.6)
+# Two binaries: glibc (Debian/Ubuntu) and musl (Alpine). Auto-detect at build time.
+COPY opencode /usr/local/bin/opencode-glibc
+COPY opencode-musl /usr/local/bin/opencode-musl
+RUN chmod +x /usr/local/bin/opencode-glibc /usr/local/bin/opencode-musl && \
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then \
+        ln -sf /usr/local/bin/opencode-musl /usr/local/bin/opencode; \
+    else \
+        ln -sf /usr/local/bin/opencode-glibc /usr/local/bin/opencode; \
+    fi
+
+# Ensure git user is configured
+RUN git config --global user.email "setup@swebench.config" && \
+    git config --global user.name "SWE-bench"
+
+# Create initial commit (used for diff later; HEAD = fixed_state)
+# Disable git hooks (husky/commitlint) that exist in some JS/TS repos (e.g. vuejs/core, axios)
+RUN cd {{ workdir }} && \
+    git config core.hooksPath /dev/null && \
+    HUSKY=0 git add -A && \
+    HUSKY=0 git commit --allow-empty --no-verify -am "initial state"
+
+{% else %}
+# ======= swebench path (existing) =======
+FROM {{ env_image }}
+
+# Ensure curl and gpg are available (some base images lack them)
+RUN (command -v apt-get && apt-get update -qq && apt-get install -y -qq curl gnupg ca-certificates >/dev/null) || \
+    (command -v apk && apk add --no-cache curl gnupg ca-certificates) || true
+RUN rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh
+RUN mkdir -p /logs
+
+# Run swebench's setup_repo.sh to clone repo, checkout commit, install deps
+# This replicates the swebench "instance image" layer (env -> instance)
+COPY setup_repo.sh /root/setup_repo.sh
+RUN sed -i -e 's/\r$//' /root/setup_repo.sh
+RUN /bin/bash /root/setup_repo.sh
+
+WORKDIR /testbed
+
+# Copy solving agent's instruction into container
+COPY instruction.md /testbed/instruction.md
+RUN mkdir -p /tests
+
+# Copy language-aware test result judge
+COPY judge_testcase.py /tests/judge_testcase.py
+RUN chmod +x /tests/judge_testcase.py
+
+# Apply code_patch so agent sees fixed code and can write tests against it
+# Tag buggy_state before applying (for TEST_DYNAMIC Phase 1 reversal)
+# Tag fixed_state after applying (for TEST_DYNAMIC Phase 2 restore)
+{% if code_patch_file %}
+COPY {{ code_patch_file }} /tests/code_patch.diff
+RUN cd /testbed && \
+    git config --global user.email "setup@swebench.config" && \
+    git config --global user.name "SWE-bench" && \
+    git config core.hooksPath /dev/null && \
+    HUSKY=0 git add -A && HUSKY=0 git commit --allow-empty --no-verify -am "buggy state" && git tag buggy_state && \
+    git apply /tests/code_patch.diff && \
+    HUSKY=0 git add -A && HUSKY=0 git commit --allow-empty --no-verify -am "fixed state" && git tag fixed_state
+{% endif %}
+
+# Install OpenCode CLI for Eval Agent (pre-downloaded binary, version pinned v1.4.6)
+# Two binaries: glibc (Debian/Ubuntu) and musl (Alpine). Auto-detect at build time.
+COPY opencode /usr/local/bin/opencode-glibc
+COPY opencode-musl /usr/local/bin/opencode-musl
+RUN chmod +x /usr/local/bin/opencode-glibc /usr/local/bin/opencode-musl && \
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then \
+        ln -sf /usr/local/bin/opencode-musl /usr/local/bin/opencode; \
+    else \
+        ln -sf /usr/local/bin/opencode-glibc /usr/local/bin/opencode; \
+    fi
+
+# Ensure git user is configured (env image for multilingual repos may lack it)
+RUN git config --global user.email "setup@swebench.config" && \
+    git config --global user.name "SWE-bench"
+
+# Create initial commit (used for diff later; HEAD = fixed_state)
+# Disable git hooks (husky/commitlint) that exist in some JS/TS repos (e.g. vuejs/core, axios)
+RUN cd /testbed && \
+    git config core.hooksPath /dev/null && \
+    HUSKY=0 git add -A && \
+    HUSKY=0 git commit --allow-empty --no-verify -am "initial state"
+{% endif %}

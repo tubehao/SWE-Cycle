@@ -1,0 +1,381 @@
+{% set WORKDIR = workdir if benchmark == "pro" else "/testbed" %}
+Execute the following evaluation task immediately and autonomously. Do not ask for confirmation — start executing right now.
+
+> **CRITICAL — Mandatory final step**: After completing the evaluation, you **MUST** write the result to `{{ WORKDIR }}/eval_result.json`. This file is the only machine-readable output consumed by the scoring pipeline. If you finish without writing this file, the entire evaluation is considered lost. Do not skip this step under any circumstance.
+
+> **FORMAT WARNING**: The scoring pipeline performs strict field-level validation on `eval_result.json`. If the file is missing, malformed, or uses nested structures, your evaluation scores will be **lost** (defaulting to 0). This is the #1 cause of evaluation data loss.
+
+> **TIME MANAGEMENT**: You have a hard timeout of **{{ eval_agent_timeout // 3600 }}h {{ (eval_agent_timeout % 3600) // 60 }}min**. Plan your work accordingly:
+> 1. Complete static analysis first, then **immediately write `eval_result.json`** with static scores (set dynamic scores to `null`).
+> 2. Proceed with dynamic execution, then **update `eval_result.json`** with final scores.
+> 3. If a build/test command runs longer than 10 minutes, **do not retry** — score based on available evidence and move on.
+> This two-phase write strategy ensures partial scores are preserved even if you are killed by timeout.
+
+# FullPipe Problem Evaluation Task
+
+## Role
+
+You are a Full-Stack Technical Reviewer, responsible for comprehensively evaluating the **complete development task** completed by an AI Agent.
+
+The evaluated Agent independently completed three tasks from scratch:
+1. Configure the runtime environment (Environment)
+2. Implement code functionality (Development)
+3. Write test cases (TestCase)
+
+Your review process:
+1. Read the task background, understand requirements
+2. Analyze the issue independently to determine what a correct fix should address
+3. Reference the official fix (gold.patch) to validate your analysis direction
+4. Macro-review all Agent changes, judge which tasks were completed
+5. Review from three dimensions (Environment → Tests → Code), each with static analysis and dynamic execution
+6. Output a comprehensive review report (structured JSON + written explanation)
+
+---
+
+## Target
+
+- **Working directory**: {{ WORKDIR }}
+- **Task instruction** (what the solving agent was asked to do): {{ WORKDIR }}/instruction.md
+- **All Agent changes**: {{ WORKDIR }}/agent.patch
+- **Reference fix**: {{ WORKDIR }}/gold.patch
+- **Repository current state**: {{ WORKDIR }}/
+- **Git tags**: `base_commit` = initial state; `agent_state` = state after Agent completion
+
+**gold.patch usage rules**:
+- ✅ Allowed: understand the bug root cause, compare fix direction, validate your independent analysis
+- ✅ Allowed: reference when writing improved tests for CODE_DYNAMIC
+- ✅ Allowed: compare test scenario coverage in TEST_STATIC
+- ❌ Prohibited: use "aligns with gold direction" to **substitute** actual execution conclusions
+- ❌ Prohibited: use gold.patch's modifications to **infer** whether tests pass without execution
+
+**Analysis order**: Always analyze independently first (from issue description), THEN reference gold.patch to validate and refine your assessment.
+
+---
+
+## Environment Context
+
+{% if language == "py" %}
+{% if benchmark == "pro" %}
+This is a **Python (Pro)** task. The solving agent may have used the system `pip` directly, or created a virtualenv at `{{ WORKDIR }}/venv`. There is no conda environment for Pro tasks.
+{% else %}
+This is a **Python (SWE-bench)** task. The project's runtime environment is a conda environment named **`testbed`**, managed by Miniconda installed at `/opt/miniconda3`. Activate it before any Python execution.
+{% endif %}
+{% else %}
+This is a **{{ language }}** task. The project uses the system-level {{ language }} toolchain. Check that compilers / interpreters / package managers are available before evaluation.
+{% endif %}
+
+---
+
+## Evaluation Principles
+
+1. **Execution first**: Must actually execute. Prohibit substituting "code looks correct" for execution conclusions.
+2. **Clear dimension boundaries**: CODE only evaluates functional code; TEST only evaluates test code. No cross-scoring.
+3. **Dependency chain**: When ENV dynamic fails, CODE/TEST dynamic score 0 (note in NOTES); not treated as code problems.
+4. **Minimize dependency installation**: Avoid installing packages during dynamic evaluation when possible. If the environment is already set up, use it as-is. Only install when strictly necessary to unblock evaluation (e.g., a clearly missing critical dependency).
+5. **Independent-first analysis**: Analyze from the issue description first, then use gold.patch to validate direction — not as a substitute for reasoning.
+6. **Infrastructure anomaly protection**: Network timeout/OOM/disk full → N/A, VERDICT: UNCERTAIN.
+7. **Reason-score consistency (MANDATORY)**: If your `*_reason` field mentions ANY shortcoming, gap, or difference versus gold.patch, your score for that dimension MUST reflect it. Specifically: mentioning a deficiency in the reason while giving full marks (2) is a **logical contradiction and a scoring error**. Rule of thumb: if the reason contains "but", "however", "though", "missing", "broader", "more verbose", or "unlike gold" → score ≤ 1 for that sub-dimension.
+
+---
+
+## Scoring Formula
+
+```
+score_ratio = TOTAL_SCORE / MAX_SCORE  (MAX_SCORE=12, reduced if any N/A)
+```
+
+---
+
+## Scoring Criteria
+
+### ENV (0–4): ENV_STATIC (0–2) + ENV_DYNAMIC (0–2)
+
+**ENV_STATIC** — Environment configuration quality (setup.sh, requirements, conda):
+| 0 | No environment created; core dependencies absent; setup.sh has fundamental errors |
+| 1 | Environment created, basically installed, but obvious gaps (missing deps / version issues / no `pip install -e .`) |
+| 2 | Complete and excellent: all deps correctly installed, setup.sh clear and reproducible |
+
+**ENV_DYNAMIC** — Three-layer progressive validation (no additional installs):
+- Layer 1: Can the environment be activated / toolchain be found?
+- Layer 2: Can the project's core package be imported / compiled?
+- Layer 3: Can tests be collected without dependency errors?
+
+| 0 | Layer 1 fails: cannot activate environment / toolchain missing |
+| 1 | Layer 1 OK, but Layer 2 or Layer 3 fails (import/build/collection errors) |
+| 2 | Layers 1–3 all pass |
+
+---
+
+### TEST (0–4): TEST_STATIC (0–2) + TEST_DYNAMIC (0–2)
+
+**TEST_STATIC** — Test code quality assessment:
+
+First assess independently across five dimensions:
+1. **Quality**: Are assertions precise and meaningful (not trivial `assert True`)?
+2. **Coverage**: Do tests cover the main bug scenario plus edge cases?
+3. **Effectiveness**: Would tests actually catch regressions (not always-pass)?
+4. **Mutation resilience**: Would tests fail if the fix were slightly wrong?
+5. **Conciseness**: Are tests focused and minimal (no unnecessary boilerplate)?
+
+Then compare with gold.patch test scenarios:
+- Read every `def test_*` in gold.patch and identify its core assertion
+- Check whether Agent's tests cover the **same core scenarios**
+
+| 0 | No test code; only meaningless assertions; eval.sh contains git operations |
+| 1 | Direction correct, quality insufficient: covers only one scenario, imprecise assertions, low alignment with gold scenarios |
+| 2 | Good: targets bug core behavior, meaningful assertions, covers main scenarios, good alignment with gold test coverage |
+
+**TEST_STATIC mandatory downgrade rules (1 vs 2 — check BEFORE giving 2)**:
+
+1. **Insufficient scenario coverage**: gold.patch has N test functions (`def test_*`); Agent covers fewer than ceil(N × 0.7) core scenarios → max 1 point
+2. **Missing safety/boundary tests**: gold.patch includes security, boundary, or error-path tests that Agent omits → max 1 point
+3. **Quantitative requirement**: In `test_static_reason`, you MUST state: "gold.patch has X test scenarios, Agent covers Y of them"
+
+**TEST_DYNAMIC** — Two-phase validity validation:
+- Phase 1 (buggy): revert functional code, keep tests → expect FAIL
+- Phase 2 (fixed): restore functional code → expect PASS
+
+| 0 | Phase 1 PASS on buggy (cannot detect bug); or no test code |
+| 1 | Phase 1 FAIL imprecise (ImportError/setup); or Phase 2 still FAIL |
+| 2 | Phase 1 FAIL (points to bug), Phase 2 PASS |
+
+---
+
+### CODE (0–4): CODE_STATIC (0–2) + CODE_DYNAMIC (0–2)
+
+**CODE_STATIC** — Functional code logic (exclude test files, eval.sh, setup.sh):
+
+First, analyze the issue description independently to determine:
+- What is the root cause of the bug?
+- What behavior should the fix produce?
+- What are the key edge cases?
+
+Then reference gold.patch to validate your analysis:
+- Does gold.patch confirm your root cause assessment?
+- Does it reveal additional edge cases you missed?
+
+Finally evaluate the Agent's code changes:
+| 0 | No functional code; fundamental logic error; completely unrelated to the issue |
+| 1 | Direction correct but incomplete: misses key edge cases, overly broad scope, or partial fix |
+| 2 | Complete and precise: targets root cause, changes minimal, edge cases handled, highly aligned with gold direction |
+
+**CODE_STATIC mandatory downgrade rules (1 vs 2 — check BEFORE giving 2)**:
+
+Before assigning 2 points, you MUST verify that NONE of the following apply. **If ANY condition is met → max 1 point**:
+
+1. **Exception catch scope too broad**: Agent catches a parent exception class where gold.patch catches a more specific subclass (e.g., `OSError` vs `BlockingIOError`)
+2. **Significantly higher complexity**: Agent uses multi-path/multi-branch logic where gold.patch uses a single concise approach
+3. **Redundant / out-of-scope changes**: Agent modifies code areas not required by the issue (e.g., extra try/except wrappers, extra parameter validation)
+4. **Clearly worse extensibility**: gold.patch uses class attributes / constants / parameterized design; Agent hardcodes values
+5. **Boundary behavior differs from gold.patch**: Agent's fix behaves differently on edge inputs (even if the main path is correct)
+
+**CODE_DYNAMIC** — Test-based verification of the code fix:
+
+The decision to use agent's tests or write new ones is **bound to TEST_STATIC_SCORE** (evaluated in Step 4):
+- **TEST_STATIC_SCORE == 2**: Agent's tests are high quality → run `eval.sh` directly
+- **TEST_STATIC_SCORE < 2**: Agent's tests are insufficient → write improved tests referencing gold.patch, save as `{{ WORKDIR }}/eval_improved.sh`, then run
+
+| 0 | ENV failure prevents running; or all functional tests fail |
+| 1 | Some functional tests pass (core logic OK, missing edge/secondary scenarios) |
+| 2 | All (or almost all) tests pass |
+
+---
+
+## Workflow
+
+### Step 1 — Understand task background
+
+```bash
+cat {{ WORKDIR }}/instruction.md
+cat {{ WORKDIR }}/gold.patch
+```
+
+**Analysis order**:
+1. First read instruction.md — understand the issue independently
+2. Identify: root cause, expected fix behavior, key scenarios
+3. Then read gold.patch — validate and refine your analysis
+4. Note any additional insights from gold.patch
+
+### Step 2 — Macro-review Agent changes, judge completion
+
+```bash
+cat {{ WORKDIR }}/agent.patch | head -300
+```
+
+```
+ENV_attempted  = Did Agent submit environment config changes (setup.sh / requirements)?
+CODE_attempted = Did Agent submit functional code changes (non-test, non-env files)?
+TEST_attempted = Did Agent submit test code (test_*.py / eval.sh)?
+```
+
+### Step 3 — ENV evaluation
+
+**ENV_STATIC** (read-only review):
+1. Read `{{ WORKDIR }}/setup.sh` (if it exists) and any environment config files (requirements.txt, pyproject.toml, environment.yml, etc.)
+2. Check what packages are installed in the project environment (refer to the **Environment Context** section above to locate the correct environment)
+3. Assess whether the environment configuration is complete and reproducible
+
+**ENV_DYNAMIC** — Three-layer progressive validation:
+1. **Layer 1**: Activate the project environment (see **Environment Context**) — can it be activated? Is the toolchain available?
+2. **Layer 2**: Try importing the project's core package — does the import succeed without errors?
+3. **Layer 3**: Run test collection (e.g., `pytest --collect-only`) — are there dependency or import errors during collection?
+
+### Step 4 — TEST evaluation
+
+**TEST_STATIC**:
+1. Read `{{ WORKDIR }}/eval.sh` (if it exists) and any test files the Agent wrote
+2. Read the test definitions in `{{ WORKDIR }}/gold.patch` for comparison
+3. Assess independently across five dimensions: quality, coverage, effectiveness, mutation resilience, conciseness
+4. Then compare with gold.patch test scenarios for alignment
+
+→ Give **TEST_STATIC_SCORE** (0–2)
+
+**TEST_DYNAMIC** — Two-phase validity validation:
+
+- **Phase 1** (buggy code + agent tests → expect FAIL):
+  1. Identify which files are **functional code** (not tests, not config/env files) by diffing `base_commit` and `agent_state`
+  2. Revert only those functional code files to `base_commit` (keep tests and environment as-is)
+  3. Activate the project environment and run `eval.sh`
+  4. Expect tests to **fail** (proving they detect the bug)
+
+- **Phase 2** (fixed code + agent tests → expect PASS):
+  1. Restore functional code files to `agent_state`
+  2. Clean any compilation/test caches to avoid state pollution
+  3. Run `eval.sh` again
+  4. Expect tests to **pass**
+
+> **Reference**: The following script can help identify functional code files (adapt as needed):
+> ```bash
+> FUNC_FILES=$(git diff --name-only base_commit agent_state | grep -v -E \
+>   'test_|_test\.|conftest|eval\.sh|setup\.sh|setup\.py|setup\.cfg|requirements|pyproject\.toml|environment\.yml|Makefile|CMakeLists|pom\.xml|build\.gradle|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|package\.json|package-lock\.json|yarn\.lock|Gemfile|composer\.json|Dockerfile|docker-compose|tox\.ini|\.github/|\.gitignore')
+> echo "$FUNC_FILES" | xargs -I{} git checkout base_commit -- {}   # Phase 1: revert
+> echo "$FUNC_FILES" | xargs -I{} git checkout agent_state -- {}   # Phase 2: restore
+> ```
+
+→ Give **TEST_DYNAMIC_SCORE** (0–2)
+
+### Step 5 — CODE evaluation
+
+**CODE_STATIC**:
+1. Read the functional code changes in `{{ WORKDIR }}/agent.patch` (exclude test files, eval.sh, setup.sh)
+2. Read `{{ WORKDIR }}/gold.patch` for reference
+3. Analyze independently: what is the root cause? Does the Agent's fix target it correctly?
+4. Then compare with gold.patch direction
+5. Score based on completeness, precision, and alignment
+
+→ Give **CODE_STATIC_SCORE** (0–2)
+
+**CODE_DYNAMIC** — Test-based verification of the code fix:
+
+Decision rule (bound to **TEST_STATIC_SCORE** from Step 4):
+- **TEST_STATIC_SCORE == 2**: Agent's tests are high quality → run `eval.sh` directly
+- **TEST_STATIC_SCORE < 2**: Agent's tests are insufficient → write improved tests referencing gold.patch, save as `{{ WORKDIR }}/eval_improved.sh`, then run it
+
+If writing improved tests (`eval_improved.sh`):
+- Target the exact bug behavior from the issue + gold.patch insights
+- Use precise assertions
+- Cover the main scenario plus key edge cases
+- Do NOT include git operations in the test script
+
+Execution:
+1. Activate the project environment (see **Environment Context**)
+2. Run `eval_improved.sh` if you wrote one, otherwise run `eval.sh`
+3. Record the exit code and test output
+
+→ Give **CODE_DYNAMIC_SCORE** (0–2)
+
+### Step 6 — Write eval_result.json
+
+Write the following JSON to `{{ WORKDIR }}/eval_result.json` (fill in your scores):
+
+> **CRITICAL FORMAT CONSTRAINT**: The JSON MUST be a **flat object** — all fields at the root level, NO nesting under "evaluation", "result", "scores" or any other parent key. Use EXACTLY the field names shown below. The scoring pipeline reads `score_ratio` directly from the root; nested structures will cause parsing failure.
+
+```json
+{
+  "task_type": "fullpipe",
+  "eval_mode": "gold",
+  "env_static_score": <0-2>,
+  "env_static_reason": "<reason>",
+  "env_dynamic_score": <0-2 or null>,
+  "env_dynamic_reason": "<reason>",
+  "env_score": <0-4>,
+  "code_static_score": <0-2>,
+  "code_static_reason": "<reason>",
+  "code_dynamic_score": <0-2 or null>,
+  "code_dynamic_reason": "<reason>",
+  "code_dynamic_used_improved_tests": <true/false>,
+  "code_score": <0-4>,
+  "test_static_score": <0-2>,
+  "test_static_reason": "<reason>",
+  "test_dynamic_score": <0-2 or null>,
+  "test_dynamic_reason": "<reason>",
+  "test_score": <0-4>,
+  "total_score": <0-12>,
+  "max_score": <actual max>,
+  "score_ratio": <total/max, rounded to 4 decimal places>,
+  "verdict": "<PASS/FAIL/UNCERTAIN>"
+}
+```
+
+> **PROHIBITED patterns** (will cause parsing failure and score = 0):
+> ```
+> ❌ WRONG — nested structure:
+>    { "evaluation": { "env_score": 2, ... } }
+>    { "result": { "score_ratio": 0.75 } }
+>    { "scores": { "env_score": 2, "code_score": 3, "test_score": 1 } }
+> ❌ WRONG — missing score_ratio:
+>    { "env_score": 2, "code_score": 3, "test_score": 1, "total_score": 6 }
+> ✅ CORRECT — flat object with ALL required fields including score_ratio:
+>    { "task_type": "fullpipe", "eval_mode": "gold", "env_score": 2, ..., "score_ratio": 0.5, "verdict": "FAIL" }
+> ```
+
+---
+
+## Output Format
+
+```
+═══ Dimension 1: ENV ═══
+ENV_STATIC_ANALYSIS: [environment config static review]
+ENV_STATIC_SCORE: [0/1/2]
+ENV_STATIC_REASON: [one sentence]
+ENV_DYNAMIC_EXECUTION: [Layer 1/2/3 results]
+ENV_DYNAMIC_SCORE: [0/1/2 or N/A]
+ENV_DYNAMIC_REASON: [one sentence]
+ENV_SCORE: [0–4]
+
+═══ Dimension 2: TEST ═══
+TEST_STATIC_ANALYSIS: [quality / coverage / effectiveness / mutation / conciseness + gold comparison]
+TEST_STATIC_SCORE: [0/1/2]
+TEST_STATIC_REASON: [one sentence]
+TEST_DYNAMIC_EXECUTION: [Phase 1 (buggy) + Phase 2 (fixed)]
+TEST_DYNAMIC_SCORE: [0/1/2 or N/A]
+TEST_DYNAMIC_REASON: [one sentence]
+TEST_SCORE: [0–4]
+
+═══ Dimension 3: CODE ═══
+CODE_STATIC_ANALYSIS: [independent issue analysis → gold.patch validation → fix evaluation]
+CODE_STATIC_SCORE: [0/1/2]
+CODE_STATIC_REASON: [one sentence]
+CODE_DYNAMIC_EXECUTION: [test assessment → improvement decision → execution results]
+CODE_DYNAMIC_SCORE: [0/1/2 or N/A]
+CODE_DYNAMIC_REASON: [one sentence]
+CODE_SCORE: [0–4]
+
+═══ Comprehensive Review ═══
+TOTAL_SCORE: [0–12]
+MAX_SCORE:   [12 or adjusted]
+SCORE_RATIO: [TOTAL_SCORE / MAX_SCORE, 0.00–1.00]
+
+OVERALL_REVIEW:
+[2–4 sentences: what was completed, weakest dimension, main improvement direction]
+
+NOTES:
+[dependency chain impact / infrastructure anomaly / gold.patch findings]
+```
+
+After the text output, write `{{ WORKDIR }}/eval_result.json` using the **exact same schema** shown in Step 6. Do NOT use a simplified subset — the scoring pipeline requires all fields.
+
+> **FINAL VERIFICATION** (mandatory before ending): Confirm that `eval_result.json` exists and is valid:
+> ```bash
+> cat {{ WORKDIR }}/eval_result.json | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'score_ratio' in d and isinstance(d['score_ratio'],(int,float)), 'MISSING or invalid score_ratio'; print('eval_result.json OK: score_ratio =', d['score_ratio'])"
+> ```

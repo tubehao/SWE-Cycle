@@ -1,0 +1,19 @@
+{
+  "model": "customproxy/${CCB_OPENCODE_MODEL}",
+  "provider": {
+    "customproxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Default",
+      "options": {
+        "baseURL": "${OPENAI_BASE_URL}",
+        "apiKey": "${CCB_OPENCODE_API_KEY}"
+      },
+      "models": {
+        "${CCB_OPENCODE_MODEL}": {
+          "name": "Claude Sonnet 4.6 (AWS)",
+          "limit": { "context": 200000, "output": 65536 }
+        }
+      }
+    }
+  }
+}

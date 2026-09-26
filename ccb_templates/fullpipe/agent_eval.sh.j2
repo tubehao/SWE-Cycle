@@ -1,0 +1,590 @@
+#!/bin/bash
+set -euo pipefail
+export PATH="/root/.local/bin:$PATH"
+
+mkdir -p /logs/artifacts /logs/verifier
+
+{% set WORKDIR = workdir if benchmark == "pro" else "/testbed" %}
+{% set WORKDIR_BLIND = workdir ~ "_blind" if benchmark == "pro" else "/testbed_blind" %}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 0: Prepare (before timing — copy time not counted toward eval timeout)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 0.1 Collect agent's git diff and tag agent_state
+cd {{ WORKDIR }}
+rm -f {{ WORKDIR }}/.git/index.lock
+git add -A
+git diff --cached HEAD > /logs/artifacts/prediction.diff 2>/dev/null || true
+git tag agent_state 2>/dev/null || true
+
+# 0.2 Copy agent.patch into workdir
+cp /logs/artifacts/prediction.diff {{ WORKDIR }}/agent.patch 2>/dev/null || true
+
+# 0.3 Full copy of workdir for blind agent (before timing)
+echo "[agent_eval] Copying workdir for blind agent..."
+COPY_START=$(date +%s)
+cp -a {{ WORKDIR }} {{ WORKDIR_BLIND }}
+COPY_END=$(date +%s)
+echo "[agent_eval] Copy took $((COPY_END - COPY_START))s"
+
+# 0.4 Set up gold workdir: inject gold.patch + gold eval_prompt
+cp /tests/gold.patch {{ WORKDIR }}/gold.patch 2>/dev/null || true
+cp /tests/eval_prompt.md {{ WORKDIR }}/eval_prompt.md 2>/dev/null || true
+
+# 0.5 Set up blind workdir: inject blind eval_prompt, ensure NO gold.patch
+rm -f {{ WORKDIR_BLIND }}/gold.patch
+cp /tests/eval_prompt_blind.md {{ WORKDIR_BLIND }}/eval_prompt.md 2>/dev/null || true
+# Copy agent.patch to blind workdir too
+cp /logs/artifacts/prediction.diff {{ WORKDIR_BLIND }}/agent.patch 2>/dev/null || true
+
+{% if benchmark != "pro" or use_eval_agent %}
+{% if ablation_eval_models %}
+# ══════════════════════════════════════════════════════════════════════════════
+# ABLATION MODE: Run N eval models in parallel
+# ══════════════════════════════════════════════════════════════════════════════
+
+{% set models = ablation_eval_models %}
+{% set N = models | length %}
+
+# Phase 0a: Copy workdirs for additional models (model 0 reuses {{ WORKDIR }})
+{% for model in models %}
+{% if loop.index0 > 0 %}
+echo "[agent_eval] Copying workdir for model {{ loop.index0 }}: {{ model }}..."
+COPY_M{{ loop.index0 }}_START=$(date +%s)
+cp -a {{ WORKDIR }} {{ WORKDIR }}_ablation_{{ loop.index0 }}
+COPY_M{{ loop.index0 }}_END=$(date +%s)
+echo "[agent_eval] Copy for model {{ loop.index0 }} took $((COPY_M{{ loop.index0 }}_END - COPY_M{{ loop.index0 }}_START))s"
+{% endif %}
+{% endfor %}
+
+# Phase 0b: Inject gold.patch + eval_prompt.md + agent.patch into each workdir
+{% for model in models %}
+{% if loop.index0 == 0 %}
+# Model 0 ({{ model }}): reuses {{ WORKDIR }} — already has gold.patch, eval_prompt.md, agent.patch
+{% else %}
+cp /tests/gold.patch {{ WORKDIR }}_ablation_{{ loop.index0 }}/gold.patch 2>/dev/null || true
+cp /tests/eval_prompt.md {{ WORKDIR }}_ablation_{{ loop.index0 }}/eval_prompt.md 2>/dev/null || true
+cp /logs/artifacts/prediction.diff {{ WORKDIR }}_ablation_{{ loop.index0 }}/agent.patch 2>/dev/null || true
+{% endif %}
+{% endfor %}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1: Run {{ N }} eval agents in parallel (timing starts here)
+# ══════════════════════════════════════════════════════════════════════════════
+
+EVAL_AGENT_TIMEOUT={{ eval_agent_timeout }}
+EVAL_START=$(date +%s)
+
+{% for model in models %}
+{% set idx = loop.index0 %}
+{% set wdir = WORKDIR if idx == 0 else WORKDIR ~ "_ablation_" ~ idx %}
+# ── Model {{ idx }}: {{ model }} ──
+(
+  export XDG_CONFIG_HOME=/tmp/eval_ablation_{{ idx }}_config
+  export XDG_DATA_HOME=/tmp/eval_ablation_{{ idx }}_data
+  export GRADLE_USER_HOME=/tmp/eval_ablation_{{ idx }}_gradle
+  export MAVEN_OPTS="${MAVEN_OPTS:-} -Dmaven.repo.local=/tmp/eval_ablation_{{ idx }}_m2"
+  rm -rf "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" 2>/dev/null || true
+  mkdir -p "$XDG_CONFIG_HOME/opencode"
+
+  printf '{\n  "model": "customproxy/{{ model }}",\n  "permission": "allow",\n  "provider": {\n    "customproxy": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "Default",\n      "options": {\n        "baseURL": "'$OPENAI_BASE_URL'",\n        "apiKey": "{{ opencode_api_key }}"\n      },\n      "models": {\n        "{{ model }}": {\n          "name": "Eval Model",\n          "limit": { "context": 200000, "output": 65536 }\n        }\n      }\n    }\n  }\n}\n' > "$XDG_CONFIG_HOME/opencode/opencode.json"
+
+  _TRACK_START=$(date +%s)
+  for _attempt in $(seq 1 3); do
+    if [ $_attempt -gt 1 ]; then
+      rm -rf "$XDG_DATA_HOME" 2>/dev/null || true
+      mkdir -p "$XDG_DATA_HOME"
+    fi
+    _now=$(date +%s)
+    _remaining=$((EVAL_AGENT_TIMEOUT - (_now - _TRACK_START)))
+    if [ $_remaining -lt 120 ]; then
+      echo "[RETRY] Model {{ idx }} ({{ model }}): only ${_remaining}s remaining, skipping retry"
+      break
+    fi
+    OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000 timeout ${_remaining} opencode run @eval_prompt.md \
+      --dir {{ wdir }} \
+      2>&1 | tee {{ wdir }}/eval_last_message.txt
+    _exit_code=${PIPESTATUS[0]}
+    if [ $_exit_code -eq 0 ] || [ -f "{{ wdir }}/eval_result.json" ]; then break; fi
+    if [ $_exit_code -eq 124 ]; then break; fi
+    if [ $_attempt -lt 3 ]; then
+      _backoff=$((60 * _attempt))
+      echo "[RETRY] Model {{ idx }} ({{ model }}) attempt $_attempt/3 failed (exit=$_exit_code), retrying in ${_backoff}s..."
+      sleep $_backoff
+    fi
+  done
+) > /logs/artifacts/eval_trajectory_model_{{ idx }}.txt 2>&1 &
+ablation_pid_{{ idx }}=$!
+
+{% endfor %}
+
+# Wait for all agents to finish
+set +e
+{% for model in models %}
+wait $ablation_pid_{{ loop.index0 }} 2>/dev/null
+ablation_exit_{{ loop.index0 }}=$?
+{% endfor %}
+set -e
+
+EVAL_END=$(date +%s)
+EVAL_ELAPSED=$((EVAL_END - EVAL_START))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2: Collect results
+# ══════════════════════════════════════════════════════════════════════════════
+
+{% for model in models %}
+{% set idx = loop.index0 %}
+{% set wdir = WORKDIR if idx == 0 else WORKDIR ~ "_ablation_" ~ idx %}
+cp {{ wdir }}/eval_last_message.txt /logs/artifacts/eval_last_message_model_{{ idx }}.txt 2>/dev/null || true
+cp {{ wdir }}/eval_result.json /logs/artifacts/eval_result_model_{{ idx }}.json 2>/dev/null || true
+{% endfor %}
+
+# Backward compatibility: downstream tools expect old filenames (use model 0)
+cp /logs/artifacts/eval_trajectory_model_0.txt /logs/artifacts/eval_trajectory.txt 2>/dev/null || true
+cp /logs/artifacts/eval_result_model_0.json /logs/artifacts/eval_result.json 2>/dev/null || true
+
+{% for model in models %}
+if [ $ablation_exit_{{ loop.index0 }} -eq 124 ]; then
+  echo "[WARN] Model {{ loop.index0 }} ({{ model }}) eval agent timed out after ${EVAL_AGENT_TIMEOUT}s"
+fi
+{% endfor %}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3: Parse scores and write reward
+# ══════════════════════════════════════════════════════════════════════════════
+
+(cd /tests && uv run --no-project python3 -c "
+import re, os, json
+
+def parse_eval_result(result_path, last_msg_path):
+    \"\"\"Parse eval_result.json or fallback to text parsing.\"\"\"
+    text = open(last_msg_path).read() if os.path.exists(last_msg_path) else ''
+
+    def parse_score(pattern, text, vmin=0, vmax=99):
+        m = re.search(pattern, text)
+        if m:
+            try:
+                v = int(m.group(1))
+                return max(vmin, min(vmax, v))
+            except ValueError:
+                pass
+        return None
+
+    if os.path.exists(result_path):
+        try:
+            er = json.load(open(result_path))
+            # Normalize uppercase keys from non-standard eval agent output
+            _upper = {
+                'ENV_SCORE': 'env_score', 'CODE_SCORE': 'code_score',
+                'TEST_SCORE': 'test_score', 'TOTAL_SCORE': 'total_score',
+                'MAX_SCORE': 'max_score', 'SCORE_RATIO': 'score_ratio',
+            }
+            for uk, lk in _upper.items():
+                if uk in er and lk not in er:
+                    er[lk] = er[uk]
+            env_s  = er.get('env_score')
+            code_s = er.get('code_score')
+            test_s = er.get('test_score')
+            total  = er.get('total_score')
+            max_s  = er.get('max_score', 12)
+            score_ratio = er.get('score_ratio')
+            # Fallback: nested structures
+            if env_s is None and code_s is None and test_s is None:
+                for key in ('evaluation', 'result', 'scores'):
+                    nested = er.get(key)
+                    if isinstance(nested, dict):
+                        if env_s is None:  env_s  = nested.get('env_score')
+                        if code_s is None: code_s = nested.get('code_score')
+                        if test_s is None: test_s = nested.get('test_score')
+                        if total is None:  total  = nested.get('total_score')
+                        if max_s is None:  max_s  = nested.get('max_score')
+                        if score_ratio is None:
+                            nested_sr = nested.get('score_ratio')
+                            if nested_sr is not None:
+                                score_ratio = round(float(nested_sr), 4)
+            if score_ratio is None and any(v is not None for v in [env_s, code_s, test_s]):
+                _e, _c, _t = (env_s or 0), (code_s or 0), (test_s or 0)
+                if total is None: total = _e + _c + _t
+                if max_s is None: max_s = 12
+                score_ratio = round(total / max_s, 4) if max_s else None
+            return {
+                'env_score': env_s, 'code_score': code_s, 'test_score': test_s,
+                'total_score': total, 'max_score': max_s, 'score_ratio': score_ratio,
+                'raw': er,
+            }
+        except Exception:
+            pass
+
+    # Fallback: parse from text
+    env_s  = parse_score(r'ENV_SCORE:\s*([0-9]+)',  text, 0, 4)
+    code_s = parse_score(r'CODE_SCORE:\s*([0-9]+)', text, 0, 4)
+    test_s = parse_score(r'TEST_SCORE:\s*([0-9]+)', text, 0, 4)
+    if any(v is not None for v in [env_s, code_s, test_s]):
+        _e, _c, _t = (env_s or 0), (code_s or 0), (test_s or 0)
+        total = _e + _c + _t
+        max_s = 12
+        m_sr = re.search(r'SCORE_RATIO:\s*([0-9.]+)', text)
+        score_ratio = round(float(m_sr.group(1)), 4) if m_sr else round(total / max_s, 4)
+    else:
+        total = None
+        max_s = 12
+        score_ratio = None
+    return {
+        'env_score': env_s, 'code_score': code_s, 'test_score': test_s,
+        'total_score': total, 'max_score': max_s, 'score_ratio': score_ratio,
+        'raw': None,
+    }
+
+models = {{ models | tojson }}
+ablation_results = {}
+for i, model_name in enumerate(models):
+    if i == 0:
+        wdir = '{{ WORKDIR }}'
+    else:
+        wdir = '{{ WORKDIR }}_ablation_' + str(i)
+    r = parse_eval_result(
+        wdir + '/eval_result.json',
+        wdir + '/eval_last_message.txt',
+    )
+    ablation_results[model_name] = r
+
+# Primary model is model 0
+primary = ablation_results[models[0]]
+reward = primary['score_ratio']
+
+result = {
+    'instance_id': '{{ instance_id }}',
+    'task_type': 'fullpipe',
+    'reward': reward,
+    'ablation_eval_results': ablation_results,
+    'ablation_models': models,
+    'execution_time': float($EVAL_ELAPSED),
+}
+
+json.dump(result, open('{{ WORKDIR }}/result.json', 'w'), indent=2)
+json.dump(result, open('/logs/artifacts/result.json', 'w'), indent=2)
+if reward is not None:
+    open('/logs/verifier/reward.txt', 'w').write(str(reward))
+    print(f'Reward (primary {models[0]}): {reward}')
+else:
+    print('[WARN] Primary eval agent failed — reward is null, not writing reward.txt')
+for m, r in ablation_results.items():
+    print(f'{m}: env={r[\"env_score\"]} code={r[\"code_score\"]} test={r[\"test_score\"]} total={r[\"total_score\"]}/{r[\"max_score\"]} => {r[\"score_ratio\"]}')
+") || {
+  echo "[WARN] Score parsing script failed — not writing reward.txt"
+}
+
+{% else %}
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1: Run two eval agents in parallel (timing starts here)
+# ══════════════════════════════════════════════════════════════════════════════
+
+EVAL_AGENT_TIMEOUT={{ eval_agent_timeout }}
+EVAL_START=$(date +%s)
+
+# ── Gold Eval Agent ──────────────────────────────────────────────────────────
+(
+  # Isolated opencode config and session directories
+  export XDG_CONFIG_HOME=/tmp/eval_gold_config
+  export XDG_DATA_HOME=/tmp/eval_gold_data
+  export GRADLE_USER_HOME=/tmp/eval_gold_gradle
+  export MAVEN_OPTS="${MAVEN_OPTS:-} -Dmaven.repo.local=/tmp/eval_gold_m2"
+  rm -rf "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" 2>/dev/null || true
+  mkdir -p "$XDG_CONFIG_HOME/opencode"
+
+  printf '{\n  "model": "customproxy/{{ opencode_model }}",\n  "permission": "allow",\n  "provider": {\n    "customproxy": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "Default",\n      "options": {\n        "baseURL": "'$OPENAI_BASE_URL'",\n        "apiKey": "{{ opencode_api_key }}"\n      },\n      "models": {\n        "{{ opencode_model }}": {\n          "name": "Eval Model",\n          "limit": { "context": 200000, "output": 65536 }\n        }\n      }\n    }\n  }\n}\n' > "$XDG_CONFIG_HOME/opencode/opencode.json"
+
+  _TRACK_START=$(date +%s)
+  for _attempt in $(seq 1 3); do
+    if [ $_attempt -gt 1 ]; then
+      rm -rf "$XDG_DATA_HOME" 2>/dev/null || true
+      mkdir -p "$XDG_DATA_HOME"
+    fi
+    _now=$(date +%s)
+    _remaining=$((EVAL_AGENT_TIMEOUT - (_now - _TRACK_START)))
+    if [ $_remaining -lt 120 ]; then
+      echo "[RETRY] Gold: only ${_remaining}s remaining, skipping retry"
+      break
+    fi
+    OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000 timeout ${_remaining} opencode run @eval_prompt.md \
+      --dir {{ WORKDIR }} \
+      2>&1 | tee {{ WORKDIR }}/eval_last_message.txt
+    _exit_code=${PIPESTATUS[0]}
+    if [ $_exit_code -eq 0 ] || [ -f "{{ WORKDIR }}/eval_result.json" ]; then break; fi
+    if [ $_exit_code -eq 124 ]; then break; fi
+    if [ $_attempt -lt 3 ]; then
+      _backoff=$((60 * _attempt))
+      echo "[RETRY] Gold attempt $_attempt/3 failed (exit=$_exit_code), retrying in ${_backoff}s..."
+      sleep $_backoff
+    fi
+  done
+) > /logs/artifacts/eval_trajectory_gold.txt 2>&1 &
+gold_pid=$!
+
+# ── Blind Eval Agent (runs in parallel with gold) ───────────────────────────
+(
+  # Isolated opencode config and session directories
+  export XDG_CONFIG_HOME=/tmp/eval_blind_config
+  export XDG_DATA_HOME=/tmp/eval_blind_data
+  export GRADLE_USER_HOME=/tmp/eval_blind_gradle
+  export MAVEN_OPTS="${MAVEN_OPTS:-} -Dmaven.repo.local=/tmp/eval_blind_m2"
+  rm -rf "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" 2>/dev/null || true
+  mkdir -p "$XDG_CONFIG_HOME/opencode"
+
+  printf '{\n  "model": "customproxy/{{ opencode_model }}",\n  "permission": "allow",\n  "provider": {\n    "customproxy": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "Default",\n      "options": {\n        "baseURL": "'$OPENAI_BASE_URL'",\n        "apiKey": "{{ opencode_api_key }}"\n      },\n      "models": {\n        "{{ opencode_model }}": {\n          "name": "Eval Model",\n          "limit": { "context": 200000, "output": 65536 }\n        }\n      }\n    }\n  }\n}\n' > "$XDG_CONFIG_HOME/opencode/opencode.json"
+
+  _TRACK_START=$(date +%s)
+  for _attempt in $(seq 1 3); do
+    if [ $_attempt -gt 1 ]; then
+      rm -rf "$XDG_DATA_HOME" 2>/dev/null || true
+      mkdir -p "$XDG_DATA_HOME"
+    fi
+    _now=$(date +%s)
+    _remaining=$((EVAL_AGENT_TIMEOUT - (_now - _TRACK_START)))
+    if [ $_remaining -lt 120 ]; then
+      echo "[RETRY] Blind: only ${_remaining}s remaining, skipping retry"
+      break
+    fi
+    OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000 timeout ${_remaining} opencode run @eval_prompt.md \
+      --dir {{ WORKDIR_BLIND }} \
+      2>&1 | tee {{ WORKDIR_BLIND }}/eval_last_message.txt
+    _exit_code=${PIPESTATUS[0]}
+    if [ $_exit_code -eq 0 ] || [ -f "{{ WORKDIR_BLIND }}/eval_result.json" ]; then break; fi
+    if [ $_exit_code -eq 124 ]; then break; fi
+    if [ $_attempt -lt 3 ]; then
+      _backoff=$((60 * _attempt))
+      echo "[RETRY] Blind attempt $_attempt/3 failed (exit=$_exit_code), retrying in ${_backoff}s..."
+      sleep $_backoff
+    fi
+  done
+) > /logs/artifacts/eval_trajectory_blind.txt 2>&1 &
+blind_pid=$!
+
+# Wait for both agents to finish (set +e to capture real exit codes)
+set +e
+wait $gold_pid 2>/dev/null
+gold_exit=$?
+wait $blind_pid 2>/dev/null
+blind_exit=$?
+set -e
+
+EVAL_END=$(date +%s)
+EVAL_ELAPSED=$((EVAL_END - EVAL_START))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2: Collect results
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Copy artifacts
+cp {{ WORKDIR }}/eval_last_message.txt /logs/artifacts/eval_last_message.txt 2>/dev/null || true
+cp {{ WORKDIR }}/eval_result.json /logs/artifacts/eval_result_gold.json 2>/dev/null || true
+cp {{ WORKDIR_BLIND }}/eval_last_message.txt /logs/artifacts/eval_last_message_blind.txt 2>/dev/null || true
+cp {{ WORKDIR_BLIND }}/eval_result.json /logs/artifacts/eval_result_blind.json 2>/dev/null || true
+
+# Backward compatibility: run_harbor.py and generate_review_data.py expect old filenames
+cp /logs/artifacts/eval_trajectory_gold.txt /logs/artifacts/eval_trajectory.txt 2>/dev/null || true
+cp /logs/artifacts/eval_result_gold.json /logs/artifacts/eval_result.json 2>/dev/null || true
+
+if [ $gold_exit -eq 124 ]; then
+  echo "[WARN] Gold eval agent timed out after ${EVAL_AGENT_TIMEOUT}s"
+fi
+if [ $blind_exit -eq 124 ]; then
+  echo "[WARN] Blind eval agent timed out after ${EVAL_AGENT_TIMEOUT}s"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3: Parse scores and write reward
+# ══════════════════════════════════════════════════════════════════════════════
+
+(cd /tests && uv run --no-project python3 -c "
+import re, os, json
+
+def parse_eval_result(result_path, last_msg_path):
+    \"\"\"Parse eval_result.json or fallback to text parsing.\"\"\"
+    text = open(last_msg_path).read() if os.path.exists(last_msg_path) else ''
+
+    def parse_score(pattern, text, vmin=0, vmax=99):
+        m = re.search(pattern, text)
+        if m:
+            try:
+                v = int(m.group(1))
+                return max(vmin, min(vmax, v))
+            except ValueError:
+                pass
+        return None
+
+    if os.path.exists(result_path):
+        try:
+            er = json.load(open(result_path))
+            # Normalize uppercase keys from non-standard eval agent output
+            _upper = {
+                'ENV_SCORE': 'env_score', 'CODE_SCORE': 'code_score',
+                'TEST_SCORE': 'test_score', 'TOTAL_SCORE': 'total_score',
+                'MAX_SCORE': 'max_score', 'SCORE_RATIO': 'score_ratio',
+            }
+            for uk, lk in _upper.items():
+                if uk in er and lk not in er:
+                    er[lk] = er[uk]
+            env_s  = er.get('env_score')
+            code_s = er.get('code_score')
+            test_s = er.get('test_score')
+            total  = er.get('total_score')
+            max_s  = er.get('max_score', 12)
+            score_ratio = er.get('score_ratio')
+            # Fallback: nested structures
+            if env_s is None and code_s is None and test_s is None:
+                for key in ('evaluation', 'result', 'scores'):
+                    nested = er.get(key)
+                    if isinstance(nested, dict):
+                        if env_s is None:  env_s  = nested.get('env_score')
+                        if code_s is None: code_s = nested.get('code_score')
+                        if test_s is None: test_s = nested.get('test_score')
+                        if total is None:  total  = nested.get('total_score')
+                        if max_s is None:  max_s  = nested.get('max_score')
+                        if score_ratio is None:
+                            nested_sr = nested.get('score_ratio')
+                            if nested_sr is not None:
+                                score_ratio = round(float(nested_sr), 4)
+            if score_ratio is None and any(v is not None for v in [env_s, code_s, test_s]):
+                _e, _c, _t = (env_s or 0), (code_s or 0), (test_s or 0)
+                if total is None: total = _e + _c + _t
+                if max_s is None: max_s = 12
+                score_ratio = round(total / max_s, 4) if max_s else None
+            return {
+                'env_score': env_s, 'code_score': code_s, 'test_score': test_s,
+                'total_score': total, 'max_score': max_s, 'score_ratio': score_ratio,
+                'raw': er,
+            }
+        except Exception:
+            pass
+
+    # Fallback: parse from text
+    env_s  = parse_score(r'ENV_SCORE:\s*([0-9]+)',  text, 0, 4)
+    code_s = parse_score(r'CODE_SCORE:\s*([0-9]+)', text, 0, 4)
+    test_s = parse_score(r'TEST_SCORE:\s*([0-9]+)', text, 0, 4)
+    if any(v is not None for v in [env_s, code_s, test_s]):
+        _e, _c, _t = (env_s or 0), (code_s or 0), (test_s or 0)
+        total = _e + _c + _t
+        max_s = 12
+        m_sr = re.search(r'SCORE_RATIO:\s*([0-9.]+)', text)
+        score_ratio = round(float(m_sr.group(1)), 4) if m_sr else round(total / max_s, 4)
+    else:
+        total = None
+        max_s = 12
+        score_ratio = None
+    return {
+        'env_score': env_s, 'code_score': code_s, 'test_score': test_s,
+        'total_score': total, 'max_score': max_s, 'score_ratio': score_ratio,
+        'raw': None,
+    }
+
+# Parse gold results
+gold = parse_eval_result(
+    '{{ WORKDIR }}/eval_result.json',
+    '{{ WORKDIR }}/eval_last_message.txt',
+)
+
+# Parse blind results
+blind = parse_eval_result(
+    '{{ WORKDIR_BLIND }}/eval_result.json',
+    '{{ WORKDIR_BLIND }}/eval_last_message.txt',
+)
+
+# reward is determined by gold eval
+reward = gold['score_ratio']
+
+result = {
+    'instance_id': '{{ instance_id }}',
+    'task_type': 'fullpipe',
+    # Gold scores (primary, determines reward)
+    'env_score': gold['env_score'],
+    'code_score': gold['code_score'],
+    'test_score': gold['test_score'],
+    'total_score': gold['total_score'],
+    'max_score': gold['max_score'],
+    'score_ratio': gold['score_ratio'],
+    'reward': reward,
+    # Blind scores (independent record)
+    'blind_env_score': blind['env_score'],
+    'blind_code_score': blind['code_score'],
+    'blind_test_score': blind['test_score'],
+    'blind_total_score': blind['total_score'],
+    'blind_max_score': blind['max_score'],
+    'blind_score_ratio': blind['score_ratio'],
+    # Metadata
+    'execution_time': float($EVAL_ELAPSED),
+    'gold_exit': int($gold_exit),
+    'blind_exit': int($blind_exit),
+}
+
+# Preserve raw eval_result.json from both agents
+if gold.get('raw'):
+    result['gold_eval_result'] = gold['raw']
+if blind.get('raw'):
+    result['blind_eval_result'] = blind['raw']
+
+json.dump(result, open('{{ WORKDIR }}/result.json', 'w'), indent=2)
+json.dump(result, open('/logs/artifacts/result.json', 'w'), indent=2)
+if reward is not None:
+    open('/logs/verifier/reward.txt', 'w').write(str(reward))
+    print(f'Reward (gold): {reward}')
+else:
+    print('[WARN] Eval agent failed — reward is null, not writing reward.txt')
+print(f'Gold:  env={gold[\"env_score\"]} code={gold[\"code_score\"]} test={gold[\"test_score\"]} total={gold[\"total_score\"]}/{gold[\"max_score\"]} => {gold[\"score_ratio\"]}')
+print(f'Blind: env={blind[\"env_score\"]} code={blind[\"code_score\"]} test={blind[\"test_score\"]} total={blind[\"total_score\"]}/{blind[\"max_score\"]} => {blind[\"score_ratio\"]}')
+") || {
+  echo "[WARN] Score parsing script failed — not writing reward.txt"
+}
+
+{% endif %}{# ablation_eval_models #}
+
+{% else %}
+# ── Pro FullPipe fallback: per-instance run_script.sh + parser.py ─────────────
+cd {{ WORKDIR }}
+{% if before_repo_set_cmd %}
+{{ before_repo_set_cmd }}
+{% endif %}
+set +e
+bash /tests/run_script.sh {{ selected_test_files }} > /logs/verifier/stdout.log 2> /logs/verifier/stderr.log
+set -e
+
+(cd /tests && uv run --no-project python3 /tests/parser.py /logs/verifier/stdout.log /logs/verifier/stderr.log /logs/verifier/output.json)
+
+(cd /tests && uv run --no-project python3 - <<'CHECK_EOF'
+import json, sys, ast
+
+with open("/tests/config.json") as f:
+    datum = json.load(f)
+with open("/logs/verifier/output.json") as f:
+    output = json.load(f)
+
+passed = {t["name"] for t in output.get("tests", []) if t["status"] == "PASSED"}
+
+def parse_tests(test_data):
+    """Parse F2P/P2P field — handles JSON strings, Python literal strings, and lists."""
+    if isinstance(test_data, str):
+        try:
+            return json.loads(test_data)
+        except json.JSONDecodeError:
+            pass
+        try:
+            return ast.literal_eval(test_data)
+        except (ValueError, SyntaxError):
+            return []
+    elif isinstance(test_data, list):
+        return test_data
+    return []
+
+f2p = set(parse_tests(datum.get("FAIL_TO_PASS") or datum.get("fail_to_pass") or []))
+p2p = set(parse_tests(datum.get("PASS_TO_PASS") or datum.get("pass_to_pass") or []))
+
+resolved = (f2p | p2p) <= passed
+print("RESOLVED" if resolved else "NOT RESOLVED")
+with open("/logs/verifier/reward.txt", "w") as f:
+    f.write("1" if resolved else "0")
+sys.exit(0 if resolved else 1)
+CHECK_EOF
+)
+{% endif %}
