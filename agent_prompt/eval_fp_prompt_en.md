@@ -151,7 +151,7 @@ In the Agent-configured environment, run the Agent's written tests to validate c
 | **0** | ENV failure makes it impossible to run; or all functional tests fail (code has fundamental problems) |
 | **1** | Some functional tests pass (core logic implemented, but missing edge / secondary scenarios) |
 | **2** | Most functional tests pass (≥70%), code basically correct, few edge case failures |
-| **3** | All (or almost all) functional tests pass, code implementation complete and correct |
+| **3** | All functional tests pass, code implementation complete and correct |
 
 *If the Agent did not write any tests, infer based on problem.json and gold.patch statically; note in NOTES.*
 
